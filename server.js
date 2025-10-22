@@ -321,6 +321,39 @@ app.get("/calendar.ics", async (req, res) => {
   }
 });
 
+app.get("/test.ics", (req, res) => {
+    const now = new Date();
+    const in30 = new Date(now.getTime() + 30 * 60 * 1000);
+  
+    const pad = (n) => String(n).padStart(2, "0");
+    const toUTC = (d) =>
+      `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+  
+    const ics = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Bettis//Fulcrum Test//EN",
+      "CALSCALE:GREGORIAN",
+      "METHOD:PUBLISH",
+      "X-WR-CALNAME:Fulcrum Test",
+      "X-WR-TIMEZONE:UTC",
+      "BEGIN:VEVENT",
+      "UID:test-one@" + "bettis",
+      `DTSTAMP:${toUTC(now)}`,
+      `DTSTART:${toUTC(now)}`,
+      `DTEND:${toUTC(in30)}`,
+      "SUMMARY:Test Event (should appear today)",
+      "DESCRIPTION:This is a diagnostic VEVENT\\nIf you can see this, Outlook is rendering.",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n") + "\r\n";
+  
+    res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache");
+    res.status(200).send(ics);
+  });
+  
+
 /* -------------------- start -------------------- */
 app.listen(PORT, () => {
   console.log(`ICS feed running on :${PORT}`);
