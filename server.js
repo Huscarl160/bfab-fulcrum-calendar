@@ -1,10 +1,11 @@
 // server.js
-// Node 18+ (global fetch). package.json should include: "type": "module", "start": "node server.js"
+// Node 18+ (global fetch). package.json should include: "type": "module", "start": "node server.js", "engines": { "node": ">=18" }
 // Env vars:
-//   FULCRUM_TOKEN (required)          - your Fulcrum Pro JWT
+//   FULCRUM_TOKEN (required)                      - your Fulcrum Pro JWT
 //   FULCRUM_BASE  (default: https://api.fulcrumpro.com)
-//   ACCESS_KEY    (optional)          - require ?key=... on requests
-//   CACHE_TTL_SECONDS (default: 60)   - in-memory cache TTL per unique URL
+//   ACCESS_KEY    (optional)                      - require ?key=... on requests
+//   CACHE_TTL_SECONDS (default: 60)               - in-memory cache TTL per unique URL
+//   CREATED_WINDOW_BUFFER_DAYS (default: 180)     - expands created window around s/u
 
 import express from "express";
 import crypto from "crypto";
@@ -14,6 +15,11 @@ const PORT = process.env.PORT || 8787;
 const BASE = process.env.FULCRUM_BASE || "https://api.fulcrumpro.com";
 const TOKEN = process.env.FULCRUM_TOKEN;
 const ACCESS_KEY = process.env.ACCESS_KEY || null;
+const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
+const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
+
+// default statuses (exclude completed)
+const DEFAULT_STATUSES = ["scheduled", "in-progress"];
 
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
@@ -82,28 +88,24 @@ function unwrapItems(raw) {
 
 // RFC5545: lines must be <=75 octets; continuation lines begin with a space
 function foldLines(text) {
-    const out = [];
-    for (const line of text.split("\r\n")) {
-      let cur = line;
-      while (Buffer.byteLength(cur, "utf8") > 75) {
-        // find a safe cut point within 75 bytes
-        let cut = 75;
-        while (cut > 0 && Buffer.byteLength(cur.slice(0, cut), "utf8") > 75) cut--;
-        out.push(cur.slice(0, cut));
-        cur = " " + cur.slice(cut); // continuation line starts with a space
-      }
-      out.push(cur);
+  const out = [];
+  for (const line of text.split("\r\n")) {
+    let cur = line;
+    while (Buffer.byteLength(cur, "utf8") > 75) {
+      let cut = 75;
+      while (cut > 0 && Buffer.byteLength(cur.slice(0, cut), "utf8") > 75) cut--;
+      out.push(cur.slice(0, cut));
+      cur = " " + cur.slice(cut);
     }
-    return out.join("\r\n");
+    out.push(cur);
   }
-  
-  function finalizeIcs(ics) {
-    // ensure final CRLF
-    if (!ics.endsWith("\r\n")) ics += "\r\n";
-    // fold long lines for Outlook’s stricter parser
-    return foldLines(ics);
-  }
-  
+  return out.join("\r\n");
+}
+
+function finalizeIcs(ics) {
+  if (!ics.endsWith("\r\n")) ics += "\r\n";
+  return foldLines(ics);
+}
 
 /* -------------------- API endpoints used -------------------- */
 const JOBS_LIST = "/api/jobs/list";
@@ -184,8 +186,6 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
     job.id ? `Job ID: ${job.id}` : null,
   ].filter(Boolean);
 
-  const description = descLines.join("\n");
-
   const categories = [equipment || null, opName || null, status || null].filter(Boolean);
 
   return {
@@ -194,17 +194,16 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
     end,
     summary,
     location,
-    description: descLines.join("\\n"),
+    description: descLines.join("\\n"), // escaped later
     categories,
   };
 }
 
 /* -------------------- tiny per-URL cache -------------------- */
-const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const cache = new Map(); // key: req.url -> { at, body, etag }
 
 /* -------------------- ICS route -------------------- */
-// /calendar.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&status=scheduled&ops=1
+// /calendar.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&ops=1&statuses=scheduled,in-progress
 app.get("/calendar.ics", async (req, res) => {
   try {
     // Optional gate
@@ -224,16 +223,33 @@ app.get("/calendar.ics", async (req, res) => {
       return res.status(200).send(hit.body);
     }
 
-    const since = req.query.s;
+    const since = req.query.s; // ISO date (no time okay)
     const until = req.query.u;
-    const status = req.query.status;
     const includeOps = req.query.ops === "1";
     const limit = parseInt(req.query.limit || "500", 10);
 
-    // 1) list jobs
-    // TODO: if your /api/jobs/list supports server-side filters, add them here
-    // e.g., { limit, filters: { status, startFrom: since, startTo: until } }
-    const jobsResp = await postJson(JOBS_LIST, { limit });
+    // statuses: default to scheduled + in-progress, allow override via ?statuses=a,b,c
+    const statuses = req.query.statuses
+      ? String(req.query.statuses).split(",").map(s => s.trim()).filter(Boolean)
+      : DEFAULT_STATUSES.slice();
+
+    // ---- Build server-side body using *created* window ----
+    const addDays = (dateLike, n) => {
+      const x = new Date(dateLike);
+      x.setUTCDate(x.getUTCDate() + n);
+      return x.toISOString();
+    };
+    let createdAfterUtc, createdBeforeUtc;
+    if (since) createdAfterUtc = addDays(since, -CREATED_WINDOW_BUFFER_DAYS);
+    if (until) createdBeforeUtc = addDays(until,  CREATED_WINDOW_BUFFER_DAYS);
+
+    const listBody = { limit };
+    if (statuses?.length) listBody.statuses = statuses;
+    if (createdAfterUtc)  listBody.createdAfterUtc  = createdAfterUtc;
+    if (createdBeforeUtc) listBody.createdBeforeUtc = createdBeforeUtc;
+
+    // 1) list jobs (by created window + statuses)
+    const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
     // 2) optionally fetch operations for each job
@@ -243,18 +259,11 @@ app.get("/calendar.ics", async (req, res) => {
         try {
           const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 200 });
           const arr = unwrapItems(opsResp);
-
-          // normalize shape: some tenants return { operation, itemToMake } wrapper
-          const pairs = arr.map((o) => ({
-            op: o.operation || o,
-            itm: o.itemToMake || null,
-          }));
-
+          const pairs = arr.map((o) => ({ op: o.operation || o, itm: o.itemToMake || null }));
           const primary = pickPrimaryOperation(job, pairs.map((p) => p.op));
           const pair = primary
-            ? pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null }
+            ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null })
             : null;
-
           primaryOpByJob.set(job.id, pair);
         } catch {
           primaryOpByJob.set(job.id, null);
@@ -262,16 +271,31 @@ app.get("/calendar.ics", async (req, res) => {
       }
     }
 
-    // 3) filter + map to events
+    // 3) filter by actual schedule window (ops first, job fallback)
+    const toMs = (d) => (d ? new Date(d).getTime() : NaN);
+    const winStart = since ? new Date(since).getTime() : null;
+    const winEnd   = until ? new Date(until).getTime() : null;
+
     const filteredJobs = jobs.filter((j) => {
-      const s =
-        j.scheduledStartUtc || j.originalScheduledStartUtc || j.productionDueDate;
-      if (!s) return false;
-      const t = new Date(s).getTime();
-      if (since && t < new Date(since).getTime()) return false;
-      if (until && t > new Date(until).getTime()) return false;
-      if (status && String(j.status || "").toLowerCase() !== String(status).toLowerCase())
-        return false;
+      // operation times when ops=1
+      const pair = primaryOpByJob.get(j.id);
+      const op   = pair?.op;
+
+      const start =
+        op?.scheduledStartUtc || op?.originalScheduledStartUtc ||
+        j.scheduledStartUtc   || j.originalScheduledStartUtc   || j.productionDueDate;
+
+      const end =
+        op?.scheduledEndUtc || op?.originalScheduledEndUtc ||
+        j.scheduledEndUtc   || j.originalScheduledEndUtc   || start;
+
+      if (!start) return false;
+
+      const s = toMs(start);
+      const e = toMs(end) || s;
+
+      if (winStart && e < winStart) return false; // ends before window
+      if (winEnd   && s > winEnd)   return false; // starts after window
       return true;
     });
 
@@ -289,11 +313,11 @@ app.get("/calendar.ics", async (req, res) => {
       "PRODID:-//Bettis//Fulcrum Jobs Schedule//EN",
       "CALSCALE:GREGORIAN",
       "METHOD:PUBLISH",
+      "X-WR-CALNAME:Fulcrum Schedule",
+      "X-WR-TIMEZONE:UTC",
       ...events.map((e) =>
         vevent({
-          uid:
-            crypto.createHash("sha1").update(`fulcrum:${e.id}`).digest("hex") +
-            "@bettis",
+          uid: crypto.createHash("sha1").update(`fulcrum:${e.id}`).digest("hex") + "@bettis",
           start: e.start,
           end: e.end,
           summary: e.summary,
@@ -322,37 +346,36 @@ app.get("/calendar.ics", async (req, res) => {
 });
 
 app.get("/test.ics", (req, res) => {
-    const now = new Date();
-    const in30 = new Date(now.getTime() + 30 * 60 * 1000);
-  
-    const pad = (n) => String(n).padStart(2, "0");
-    const toUTC = (d) =>
-      `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
-  
-    const ics = [
-      "BEGIN:VCALENDAR",
-      "VERSION:2.0",
-      "PRODID:-//Bettis//Fulcrum Test//EN",
-      "CALSCALE:GREGORIAN",
-      "METHOD:PUBLISH",
-      "X-WR-CALNAME:Fulcrum Test",
-      "X-WR-TIMEZONE:UTC",
-      "BEGIN:VEVENT",
-      "UID:test-one@" + "bettis",
-      `DTSTAMP:${toUTC(now)}`,
-      `DTSTART:${toUTC(now)}`,
-      `DTEND:${toUTC(in30)}`,
-      "SUMMARY:Test Event (should appear today)",
-      "DESCRIPTION:This is a diagnostic VEVENT\\nIf you can see this, Outlook is rendering.",
-      "END:VEVENT",
-      "END:VCALENDAR",
-    ].join("\r\n") + "\r\n";
-  
-    res.setHeader("Content-Type", "text/calendar; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache");
-    res.status(200).send(ics);
-  });
-  
+  const now = new Date();
+  const in30 = new Date(now.getTime() + 30 * 60 * 1000);
+
+  const pad = (n) => String(n).padStart(2, "0");
+  const toUTC = (d) =>
+    `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+
+  const ics = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Bettis//Fulcrum Test//EN",
+    "CALSCALE:GREGORIAN",
+    "METHOD:PUBLISH",
+    "X-WR-CALNAME:Fulcrum Test",
+    "X-WR-TIMEZONE:UTC",
+    "BEGIN:VEVENT",
+    "UID:test-one@" + "bettis",
+    `DTSTAMP:${toUTC(now)}`,
+    `DTSTART:${toUTC(now)}`,
+    `DTEND:${toUTC(in30)}`,
+    "SUMMARY:Test Event (should appear today)",
+    "DESCRIPTION:This is a diagnostic VEVENT\\nIf you can see this, Outlook is rendering.",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n") + "\r\n";
+
+  res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache");
+  res.status(200).send(ics);
+});
 
 /* -------------------- start -------------------- */
 app.listen(PORT, () => {
