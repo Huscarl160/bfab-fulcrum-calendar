@@ -285,7 +285,7 @@ app.get("/calendar.ics", async (req, res) => {
     res.setHeader("Content-Type", "text/calendar; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("ETag", etag);
-    res.setHeader("Content-Disposition", 'inline; filename="bettis-fulcrum.ics"');
+    // res.setHeader("Content-Disposition", 'inline; filename="bettis-fulcrum.ics"');
     res.status(200).send(ics);
   } catch (err) {
     res.status(500).send(`Error: ${err.message}`);
