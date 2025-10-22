@@ -19,7 +19,27 @@ const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
 
 // default statuses (exclude completed)
-const DEFAULT_STATUSES = ["scheduled", "in-progress"];
+const DEFAULT_STATUSES = ["scheduled", "inProgress"];
+
+// map friendly inputs -> API enum
+const STATUS_MAP = new Map([
+  ["scheduled", "scheduled"],
+  ["schedule", "scheduled"],
+
+  ["in-progress", "inProgress"],
+  ["in_progress", "inProgress"],
+  ["inprogress", "inProgress"],
+
+  ["pending", "pending"],
+  ["awaiting", "pending"],
+  ["queued", "pending"],
+
+  ["complete", "complete"],
+  ["completed", "complete"],
+
+  ["cancelled", "cancelled"],
+  ["canceled", "cancelled"],
+]);
 
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
@@ -203,7 +223,7 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
 const cache = new Map(); // key: req.url -> { at, body, etag }
 
 /* -------------------- ICS route -------------------- */
-// /calendar.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&ops=1&statuses=scheduled,in-progress
+// /calendar.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&ops=1&statuses=scheduled,in-progress,pending
 app.get("/calendar.ics", async (req, res) => {
   try {
     // Optional gate
@@ -228,10 +248,16 @@ app.get("/calendar.ics", async (req, res) => {
     const includeOps = req.query.ops === "1";
     const limit = parseInt(req.query.limit || "500", 10);
 
-    // statuses: default to scheduled + in-progress, allow override via ?statuses=a,b,c
-    const statuses = req.query.statuses
+    // statuses: default to scheduled + inProgress, allow override via ?statuses=a,b,c (friendly names allowed)
+    const rawStatuses = req.query.statuses
       ? String(req.query.statuses).split(",").map(s => s.trim()).filter(Boolean)
       : DEFAULT_STATUSES.slice();
+
+    const mapped = rawStatuses
+      .map(s => STATUS_MAP.get(s.toLowerCase?.() || s))
+      .filter(Boolean);
+
+    const finalStatuses = mapped.length ? mapped : DEFAULT_STATUSES.slice();
 
     // ---- Build server-side body using *created* window ----
     const addDays = (dateLike, n) => {
@@ -244,7 +270,11 @@ app.get("/calendar.ics", async (req, res) => {
     if (until) createdBeforeUtc = addDays(until,  CREATED_WINDOW_BUFFER_DAYS);
 
     const listBody = { limit };
-    if (statuses?.length) listBody.statuses = statuses;
+    if (finalStatuses.length === 1) {
+      listBody.status = finalStatuses[0];
+    } else if (finalStatuses.length > 1) {
+      listBody.statuses = finalStatuses;
+    }
     if (createdAfterUtc)  listBody.createdAfterUtc  = createdAfterUtc;
     if (createdBeforeUtc) listBody.createdBeforeUtc = createdBeforeUtc;
 
@@ -277,7 +307,6 @@ app.get("/calendar.ics", async (req, res) => {
     const winEnd   = until ? new Date(until).getTime() : null;
 
     const filteredJobs = jobs.filter((j) => {
-      // operation times when ops=1
       const pair = primaryOpByJob.get(j.id);
       const op   = pair?.op;
 
