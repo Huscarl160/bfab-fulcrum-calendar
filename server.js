@@ -35,6 +35,31 @@ if (!TOKEN) {
   process.exit(1);
 }
 
+// ----- Ops enrichment knobs -----
+const OPS_CONCURRENCY = Number(process.env.OPS_CONCURRENCY || 8);
+const OPS_CACHE_TTL_MS = Number(process.env.OPS_CACHE_TTL_MS || 5 * 60 * 1000);
+
+// { jobId -> { at:number, data:Array } }
+const opsCache = new Map();
+
+function cacheGetOps(jobId) {
+  const hit = opsCache.get(jobId);
+  if (!hit) return null;
+  if (Date.now() - hit.at > OPS_CACHE_TTL_MS) {
+    opsCache.delete(jobId);
+    return null;
+  }
+  return hit.data;
+}
+function cachePutOps(jobId, data) {
+  opsCache.set(jobId, { at: Date.now(), data });
+  // optional simple cap
+  if (opsCache.size > 500) {
+    const oldestKey = [...opsCache.entries()].sort((a, b) => a[1].at - b[1].at)[0][0];
+    opsCache.delete(oldestKey);
+  }
+}
+
 /* -------------------- express -------------------- */
 const app = express();
 app.get("/", (_req, res) => res.send("OK"));
@@ -258,29 +283,62 @@ app.get("/calendar.ics", async (req, res) => {
     const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
-    // 2) optionally fetch operations (parallel, limited concurrency)
-    const primaryOpByJob = new Map();
-    if (includeOps && jobs.length) {
-      const concurrency = 8;
-      let i = 0;
-      async function worker() {
-        while (i < jobs.length) {
-          const idx = i++;
-          const job = jobs[idx];
-          try {
-            const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 200 });
-            const arr = unwrapItems(opsResp);
-            const pairs = arr.map((o) => ({ op: o.operation || o, itm: o.itemToMake || null }));
-            const primary = pickPrimaryOperation(job, pairs.map((p) => p.op));
-            const pair = primary ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null }) : null;
-            primaryOpByJob.set(job.id, pair);
-          } catch {
-            primaryOpByJob.set(job.id, null);
-          }
+    // 2) optionally fetch operations, but only for jobs likely in-window (by job dates)
+const primaryOpByJob = new Map();
+if (includeOps) {
+  // First, rough prefilter by job-level dates to minimize ops calls
+  const prefiltered = jobs.filter((j) => {
+    const start =
+      j.scheduledStartUtc || j.originalScheduledStartUtc || j.productionDueDate;
+    const end =
+      j.scheduledEndUtc || j.originalScheduledEndUtc || start;
+    if (!start) return false;
+    const s = since ? new Date(since).getTime() : null;
+    const u = until ? new Date(until).getTime() : null;
+    const js = new Date(start).getTime();
+    const je = new Date(end).getTime();
+    if (s && je < s) return false;
+    if (u && js > u) return false;
+    return true;
+  });
+
+  // Parallel fetch with small concurrency + 5-min cache
+  let idx = 0;
+  async function worker() {
+    while (idx < prefiltered.length) {
+      const i = idx++;
+      const job = prefiltered[i];
+
+      // cache hit?
+      let arr = cacheGetOps(job.id);
+      if (!arr) {
+        try {
+          const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 200 });
+          arr = unwrapItems(opsResp);
+          cachePutOps(job.id, arr);
+        } catch {
+          arr = null;
         }
       }
-      await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
+
+      if (arr && Array.isArray(arr)) {
+        const pairs = arr.map((o) => ({ op: o.operation || o, itm: o.itemToMake || null }));
+        const primary = pickPrimaryOperation(job, pairs.map((p) => p.op));
+        const pair =
+          primary
+            ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null })
+            : null;
+        primaryOpByJob.set(job.id, pair);
+      } else {
+        primaryOpByJob.set(job.id, null);
+      }
     }
+  }
+
+  const workers = Math.min(OPS_CONCURRENCY, Math.max(prefiltered.length, 1));
+  await Promise.all(Array.from({ length: workers }, worker));
+}
+
 
     // 3) filter by schedule window (ops first, then job)
     const toMs = (d) => (d ? new Date(d).getTime() : NaN);
