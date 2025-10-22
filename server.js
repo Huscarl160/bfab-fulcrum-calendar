@@ -80,6 +80,31 @@ function unwrapItems(raw) {
   return raw?.items || raw?.results || raw?.data || [];
 }
 
+// RFC5545: lines must be <=75 octets; continuation lines begin with a space
+function foldLines(text) {
+    const out = [];
+    for (const line of text.split("\r\n")) {
+      let cur = line;
+      while (Buffer.byteLength(cur, "utf8") > 75) {
+        // find a safe cut point within 75 bytes
+        let cut = 75;
+        while (cut > 0 && Buffer.byteLength(cur.slice(0, cut), "utf8") > 75) cut--;
+        out.push(cur.slice(0, cut));
+        cur = " " + cur.slice(cut); // continuation line starts with a space
+      }
+      out.push(cur);
+    }
+    return out.join("\r\n");
+  }
+  
+  function finalizeIcs(ics) {
+    // ensure final CRLF
+    if (!ics.endsWith("\r\n")) ics += "\r\n";
+    // fold long lines for Outlook’s stricter parser
+    return foldLines(ics);
+  }
+  
+
 /* -------------------- API endpoints used -------------------- */
 const JOBS_LIST = "/api/jobs/list";
 const JOB_OPS_LIST = (jobId) => `/api/jobs/${jobId}/operations/list`;
@@ -158,6 +183,8 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
     qtyMake || null,
     job.id ? `Job ID: ${job.id}` : null,
   ].filter(Boolean);
+
+  const description = descLines.join("\n");
 
   const categories = [equipment || null, opName || null, status || null].filter(Boolean);
 
@@ -278,15 +305,17 @@ app.get("/calendar.ics", async (req, res) => {
       "END:VCALENDAR",
     ].join("\r\n");
 
+    const safeIcs = finalizeIcs(ics);
+
     // cache write
-    const etag = 'W/"' + crypto.createHash("sha1").update(ics).digest("hex") + '"';
-    cache.set(key, { at: now, body: ics, etag });
+    const etag = 'W/"' + crypto.createHash("sha1").update(safeIcs).digest("hex") + '"';
+    cache.set(key, { at: now, body: safeIcs, etag });
 
     res.setHeader("Content-Type", "text/calendar; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("ETag", etag);
-    // res.setHeader("Content-Disposition", 'inline; filename="bettis-fulcrum.ics"');
-    res.status(200).send(ics);
+    res.setHeader("Content-Disposition", 'inline; filename="bettis-fulcrum.ics"');
+    res.status(200).send(safeIcs);
   } catch (err) {
     res.status(500).send(`Error: ${err.message}`);
   }
