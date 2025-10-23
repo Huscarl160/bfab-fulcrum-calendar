@@ -6,9 +6,11 @@
 //   ACCESS_KEY (optional)                         - require ?key=...
 //   CACHE_TTL_SECONDS (default 60)                - per-URL ICS cache
 //   CREATED_WINDOW_BUFFER_DAYS (default 180)      - expands created window around s/u
-//   DEFAULT_INCLUDE_OPS (optional, "1" to enable) - default ops enrichment if ops not specified
+//   DEFAULT_INCLUDE_OPS ("1" to enable)           - default ops enrichment if ops not specified
 //   OPS_CONCURRENCY (default 8)                   - parallel op fetch workers
 //   OPS_CACHE_TTL_MS (default 300000)             - 5 minutes op cache
+//   START_OFFSET_DAYS (default -30)               - rolling window start offset (days from today)
+//   END_OFFSET_DAYS (default 120)                 - rolling window end offset (days from today)
 
 import express from "express";
 import crypto from "crypto";
@@ -22,12 +24,12 @@ const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
 const DEFAULT_INCLUDE_OPS = process.env.DEFAULT_INCLUDE_OPS === "1";
 
-// Rolling window when s/u aren't provided
-const START_OFFSET_DAYS = Number(process.env.START_OFFSET_DAYS || -30);  // how far back
-const END_OFFSET_DAYS   = Number(process.env.END_OFFSET_DAYS   || 120);  // how far forward
-
 const OPS_CONCURRENCY = Number(process.env.OPS_CONCURRENCY || 8);
 const OPS_CACHE_TTL_MS = Number(process.env.OPS_CACHE_TTL_MS || 5 * 60 * 1000);
+
+// rolling window defaults
+const START_OFFSET_DAYS = Number(process.env.START_OFFSET_DAYS || -30);
+const END_OFFSET_DAYS   = Number(process.env.END_OFFSET_DAYS   || 120);
 
 // default: exclude completed
 const DEFAULT_STATUSES = ["scheduled", "inProgress"];
@@ -70,6 +72,51 @@ function addDaysISO(dateLike, n) {
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString();
 }
+function startOfUTC(dateLike) {
+  const d = new Date(dateLike);
+  d.setUTCHours(0, 0, 0, 0);
+  return d;
+}
+function resolveWindow(query) {
+  // explicit s/u wins
+  if (query.s && query.u) {
+    return { since: String(query.s), until: String(query.u), mode: "explicit" };
+  }
+
+  // optional shorthand window
+  if (query.window) {
+    const now = new Date();
+    const y = now.getUTCFullYear();
+    const m = now.getUTCMonth();
+    if (query.window === "month") {
+      const since = new Date(Date.UTC(y, m, 1));
+      const until = new Date(Date.UTC(y, m + 1, 0));
+      return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
+    }
+    if (query.window === "quarter") {
+      const qStartM = Math.floor(m/3)*3;
+      const since = new Date(Date.UTC(y, qStartM, 1));
+      const until = new Date(Date.UTC(y, qStartM + 3, 0));
+      return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
+    }
+    if (query.window === "year") {
+      const since = new Date(Date.UTC(y, 0, 1));
+      const until = new Date(Date.UTC(y, 12, 0));
+      return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
+    }
+  }
+
+  // rolling default (today’s UTC midnight +/- offsets)
+  const nowISO = new Date().toISOString();
+  const sinceISO = addDaysISO(startOfUTC(nowISO), START_OFFSET_DAYS);
+  const untilISO = addDaysISO(startOfUTC(nowISO), END_OFFSET_DAYS);
+  return {
+    since: sinceISO.slice(0,10),
+    until: untilISO.slice(0,10),
+    mode: "rolling",
+  };
+}
+
 function veventTimed({ uid, start, end, summary, location, description, categories }) {
   return [
     "BEGIN:VEVENT",
@@ -85,7 +132,7 @@ function veventTimed({ uid, start, end, summary, location, description, categori
   ].filter(Boolean).join("\r\n");
 }
 function veventAllDay({ uid, startDate, endDateInclusive, summary, location, description, categories }) {
-  // All-day: DTSTART/DTEND with VALUE=DATE; DTEND is exclusive → add 1 day
+  // All-day: DTEND exclusive → add 1 day
   const dtStart = yyyymmdd(startDate);
   const dtEndExclusive = yyyymmdd(addDaysISO(endDateInclusive, 1));
   return [
@@ -139,58 +186,6 @@ function finalizeIcs(ics) {
   if (!ics.endsWith("\r\n")) ics += "\r\n";
   return foldLines(ics);
 }
-
-function startOfUTC(dateLike) {
-    const d = new Date(dateLike);
-    d.setUTCHours(0,0,0,0);
-    return d;
-  }
-  function addDaysISO(dateLike, n) {
-    const d = new Date(dateLike);
-    d.setUTCDate(d.getUTCDate() + n);
-    return d.toISOString();
-  }
-  
-  // decide since/until based on query or rolling defaults
-  function resolveWindow(query) {
-    if (query.s && query.u) {
-      return { since: String(query.s), until: String(query.u), mode: "explicit" };
-    }
-  
-    // Optional “window” shorthand:
-    // ?window=month|quarter|year (you can keep or skip this block)
-    if (query.window) {
-      const now = new Date();
-      const y = now.getUTCFullYear();
-      const m = now.getUTCMonth();
-      if (query.window === "month") {
-        const since = new Date(Date.UTC(y, m, 1));
-        const until = new Date(Date.UTC(y, m + 1, 0)); // last day of month
-        return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
-      }
-      if (query.window === "quarter") {
-        const qStartM = Math.floor(m/3)*3;
-        const since = new Date(Date.UTC(y, qStartM, 1));
-        const until = new Date(Date.UTC(y, qStartM + 3, 0));
-        return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
-      }
-      if (query.window === "year") {
-        const since = new Date(Date.UTC(y, 0, 1));
-        const until = new Date(Date.UTC(y, 12, 0));
-        return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
-      }
-    }
-  
-    // Rolling default
-    const nowISO = new Date().toISOString();
-    const sinceISO = addDaysISO(startOfUTC(nowISO), START_OFFSET_DAYS);
-    const untilISO = addDaysISO(startOfUTC(nowISO), END_OFFSET_DAYS);
-    return {
-      since: sinceISO.slice(0,10),   // YYYY-MM-DD
-      until: untilISO.slice(0,10),   // YYYY-MM-DD
-      mode: "rolling"
-    };
-  }
 
 /* -------------------- API endpoints -------------------- */
 const JOBS_LIST = "/api/jobs/list";
@@ -285,7 +280,6 @@ function cacheGetOps(jobId) {
 }
 function cachePutOps(jobId, data) {
   opsCache.set(jobId, { at: Date.now(), data });
-  // simple cap
   if (opsCache.size > 500) {
     const oldestKey = [...opsCache.entries()].sort((a, b) => a[1].at - b[1].at)[0][0];
     opsCache.delete(oldestKey);
@@ -293,7 +287,7 @@ function cachePutOps(jobId, data) {
 }
 
 /* -------------------- core handler -------------------- */
-// /calendar.ics?s=YYYY-MM-DD&u=YYYY-MM-DD[&ops=1][&allday=0][&statuses=scheduled,in-progress,pending]
+// /calendar.ics?[s=YYYY-MM-DD&u=YYYY-MM-DD][&window=month|quarter|year][&ops=1][&allday=0][&statuses=scheduled,in-progress,pending]
 async function serveCalendar(req, res) {
   try {
     if (ACCESS_KEY && req.query.key !== ACCESS_KEY) return res.sendStatus(403);
@@ -342,7 +336,6 @@ async function serveCalendar(req, res) {
     // 2) optionally fetch operations (prefilter + parallel + cache)
     const primaryOpByJob = new Map();
     if (includeOps && jobs.length) {
-      // rough prefilter by job-level dates to minimize ops calls
       const sMs = since ? new Date(since).getTime() : null;
       const uMs = until ? new Date(until).getTime() : null;
       const prefiltered = jobs.filter((j) => {
@@ -376,10 +369,9 @@ async function serveCalendar(req, res) {
           if (arr && Array.isArray(arr)) {
             const pairs = arr.map((o) => ({ op: o.operation || o, itm: o.itemToMake || null }));
             const primary = pickPrimaryOperation(job, pairs.map((p) => p.op));
-            const pair =
-              primary
-                ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null })
-                : null;
+            const pair = primary
+              ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null })
+              : null;
             primaryOpByJob.set(job.id, pair);
           } else {
             primaryOpByJob.set(job.id, null);
