@@ -1,11 +1,14 @@
 // server.js
 // Node 18+. package.json: { "type":"module", "scripts":{ "start":"node server.js" }, "engines":{ "node": ">=18" } }
 // Env:
-//   FULCRUM_TOKEN (required)
-//   FULCRUM_BASE = https://api.fulcrumpro.com (default)
-//   ACCESS_KEY (optional) -> require ?key=...
-//   CACHE_TTL_SECONDS (default 60)
-//   CREATED_WINDOW_BUFFER_DAYS (default 180)
+//   FULCRUM_TOKEN (required)                      - Fulcrum Pro JWT
+//   FULCRUM_BASE (default: https://api.fulcrumpro.com)
+//   ACCESS_KEY (optional)                         - require ?key=...
+//   CACHE_TTL_SECONDS (default 60)                - per-URL ICS cache
+//   CREATED_WINDOW_BUFFER_DAYS (default 180)      - expands created window around s/u
+//   DEFAULT_INCLUDE_OPS (optional, "1" to enable) - default ops enrichment if ops not specified
+//   OPS_CONCURRENCY (default 8)                   - parallel op fetch workers
+//   OPS_CACHE_TTL_MS (default 300000)             - 5 minutes op cache
 
 import express from "express";
 import crypto from "crypto";
@@ -17,6 +20,10 @@ const TOKEN = process.env.FULCRUM_TOKEN;
 const ACCESS_KEY = process.env.ACCESS_KEY || null;
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
+const DEFAULT_INCLUDE_OPS = process.env.DEFAULT_INCLUDE_OPS === "1";
+
+const OPS_CONCURRENCY = Number(process.env.OPS_CONCURRENCY || 8);
+const OPS_CACHE_TTL_MS = Number(process.env.OPS_CACHE_TTL_MS || 5 * 60 * 1000);
 
 // default: exclude completed
 const DEFAULT_STATUSES = ["scheduled", "inProgress"];
@@ -33,31 +40,6 @@ const STATUS_MAP = new Map([
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
   process.exit(1);
-}
-
-// ----- Ops enrichment knobs -----
-const OPS_CONCURRENCY = Number(process.env.OPS_CONCURRENCY || 8);
-const OPS_CACHE_TTL_MS = Number(process.env.OPS_CACHE_TTL_MS || 5 * 60 * 1000);
-
-// { jobId -> { at:number, data:Array } }
-const opsCache = new Map();
-
-function cacheGetOps(jobId) {
-  const hit = opsCache.get(jobId);
-  if (!hit) return null;
-  if (Date.now() - hit.at > OPS_CACHE_TTL_MS) {
-    opsCache.delete(jobId);
-    return null;
-  }
-  return hit.data;
-}
-function cachePutOps(jobId, data) {
-  opsCache.set(jobId, { at: Date.now(), data });
-  // optional simple cap
-  if (opsCache.size > 500) {
-    const oldestKey = [...opsCache.entries()].sort((a, b) => a[1].at - b[1].at)[0][0];
-    opsCache.delete(oldestKey);
-  }
 }
 
 /* -------------------- express -------------------- */
@@ -99,7 +81,7 @@ function veventTimed({ uid, start, end, summary, location, description, categori
   ].filter(Boolean).join("\r\n");
 }
 function veventAllDay({ uid, startDate, endDateInclusive, summary, location, description, categories }) {
-  // For all-day: DTSTART/DTEND are VALUE=DATE and DTEND is EXCLUSIVE (so add 1 day)
+  // All-day: DTSTART/DTEND with VALUE=DATE; DTEND is exclusive → add 1 day
   const dtStart = yyyymmdd(startDate);
   const dtEndExclusive = yyyymmdd(addDaysISO(endDateInclusive, 1));
   return [
@@ -158,7 +140,7 @@ function finalizeIcs(ics) {
 const JOBS_LIST = "/api/jobs/list";
 const JOB_OPS_LIST = (jobId) => `/api/jobs/${jobId}/operations/list`;
 
-/* -------------------- operation selection -------------------- */
+/* -------------------- ops selection & mapping -------------------- */
 function pickPrimaryOperation(job, ops) {
   if (!Array.isArray(ops) || ops.length === 0) return null;
   const jStart = new Date(job.scheduledStartUtc || job.originalScheduledStartUtc || job.productionDueDate || 0).getTime();
@@ -181,17 +163,16 @@ function pickPrimaryOperation(job, ops) {
 }
 
 function mapJobToEvent(job, primaryOp, itemToMake) {
-  // Window selection preference
+  // Use job-level window for all-day; fall back to operation if needed
   const jobStart = job.scheduledStartUtc || job.originalScheduledStartUtc || job.productionDueDate;
   const jobEnd   = job.scheduledEndUtc   || job.originalScheduledEndUtc;
 
   const opStart  = primaryOp?.scheduledStartUtc || primaryOp?.originalScheduledStartUtc;
   const opEnd    = primaryOp?.scheduledEndUtc   || primaryOp?.originalScheduledEndUtc;
 
-  // For event timing we will use job window by default (all-day rendering)
   const start = jobStart || opStart;
   let end = jobEnd || opEnd || start;
-  if (!end && start) end = addDaysISO(start, 1); // safety
+  if (!end && start) end = addDaysISO(start, 1);
 
   const title = job.name || (job.number != null ? `Job #${job.number}` : "Scheduled Work");
   const number = job.number != null ? `#${job.number}` : "";
@@ -218,6 +199,7 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
     qtyMake || null,
     job.id ? `Job ID: ${job.id}` : null,
   ].filter(Boolean);
+
   const categories = [equipment || null, opName || null, status || null].filter(Boolean);
 
   return {
@@ -231,12 +213,32 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
   };
 }
 
-/* -------------------- tiny per-URL cache -------------------- */
-const cache = new Map();
+/* -------------------- tiny per-URL ICS cache -------------------- */
+const cache = new Map(); // key: req.url -> { at, body, etag }
 
-/* -------------------- ICS route -------------------- */
+/* -------------------- ops result cache -------------------- */
+const opsCache = new Map(); // jobId -> { at, data:Array }
+function cacheGetOps(jobId) {
+  const hit = opsCache.get(jobId);
+  if (!hit) return null;
+  if (Date.now() - hit.at > OPS_CACHE_TTL_MS) {
+    opsCache.delete(jobId);
+    return null;
+  }
+  return hit.data;
+}
+function cachePutOps(jobId, data) {
+  opsCache.set(jobId, { at: Date.now(), data });
+  // simple cap
+  if (opsCache.size > 500) {
+    const oldestKey = [...opsCache.entries()].sort((a, b) => a[1].at - b[1].at)[0][0];
+    opsCache.delete(oldestKey);
+  }
+}
+
+/* -------------------- core handler -------------------- */
 // /calendar.ics?s=YYYY-MM-DD&u=YYYY-MM-DD[&ops=1][&allday=0][&statuses=scheduled,in-progress,pending]
-app.get("/calendar.ics", async (req, res) => {
+async function serveCalendar(req, res) {
   try {
     if (ACCESS_KEY && req.query.key !== ACCESS_KEY) return res.sendStatus(403);
 
@@ -256,15 +258,14 @@ app.get("/calendar.ics", async (req, res) => {
 
     const since = req.query.s;
     const until = req.query.u;
-    const includeOps = req.query.ops === "1"; // default off for speed
-    const allDay = req.query.allday !== "0";  // default ON (all-day events)
+    const includeOps = req.query.ops === "1" || (req.query.ops == null && DEFAULT_INCLUDE_OPS);
+    const allDay = req.query.allday !== "0"; // default ON
     const limit = parseInt(req.query.limit || "500", 10);
 
     // statuses -> normalize to API enums
     const rawStatuses = req.query.statuses
       ? String(req.query.statuses).split(",").map(s => s.trim()).filter(Boolean)
       : DEFAULT_STATUSES.slice();
-
     const mapped = rawStatuses.map(s => STATUS_MAP.get(s.toLowerCase?.() || s)).filter(Boolean);
     const finalStatuses = mapped.length ? mapped : DEFAULT_STATUSES.slice();
 
@@ -283,62 +284,56 @@ app.get("/calendar.ics", async (req, res) => {
     const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
-    // 2) optionally fetch operations, but only for jobs likely in-window (by job dates)
-const primaryOpByJob = new Map();
-if (includeOps) {
-  // First, rough prefilter by job-level dates to minimize ops calls
-  const prefiltered = jobs.filter((j) => {
-    const start =
-      j.scheduledStartUtc || j.originalScheduledStartUtc || j.productionDueDate;
-    const end =
-      j.scheduledEndUtc || j.originalScheduledEndUtc || start;
-    if (!start) return false;
-    const s = since ? new Date(since).getTime() : null;
-    const u = until ? new Date(until).getTime() : null;
-    const js = new Date(start).getTime();
-    const je = new Date(end).getTime();
-    if (s && je < s) return false;
-    if (u && js > u) return false;
-    return true;
-  });
+    // 2) optionally fetch operations (prefilter + parallel + cache)
+    const primaryOpByJob = new Map();
+    if (includeOps && jobs.length) {
+      // rough prefilter by job-level dates to minimize ops calls
+      const sMs = since ? new Date(since).getTime() : null;
+      const uMs = until ? new Date(until).getTime() : null;
+      const prefiltered = jobs.filter((j) => {
+        const start = j.scheduledStartUtc || j.originalScheduledStartUtc || j.productionDueDate;
+        const end   = j.scheduledEndUtc   || j.originalScheduledEndUtc || start;
+        if (!start) return false;
+        const js = new Date(start).getTime();
+        const je = new Date(end).getTime();
+        if (sMs && je < sMs) return false;
+        if (uMs && js > uMs) return false;
+        return true;
+      });
 
-  // Parallel fetch with small concurrency + 5-min cache
-  let idx = 0;
-  async function worker() {
-    while (idx < prefiltered.length) {
-      const i = idx++;
-      const job = prefiltered[i];
+      let idx = 0;
+      async function worker() {
+        while (idx < prefiltered.length) {
+          const i = idx++;
+          const job = prefiltered[i];
 
-      // cache hit?
-      let arr = cacheGetOps(job.id);
-      if (!arr) {
-        try {
-          const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 200 });
-          arr = unwrapItems(opsResp);
-          cachePutOps(job.id, arr);
-        } catch {
-          arr = null;
+          let arr = cacheGetOps(job.id);
+          if (!arr) {
+            try {
+              const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 200 });
+              arr = unwrapItems(opsResp);
+              cachePutOps(job.id, arr);
+            } catch {
+              arr = null;
+            }
+          }
+
+          if (arr && Array.isArray(arr)) {
+            const pairs = arr.map((o) => ({ op: o.operation || o, itm: o.itemToMake || null }));
+            const primary = pickPrimaryOperation(job, pairs.map((p) => p.op));
+            const pair =
+              primary
+                ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null })
+                : null;
+            primaryOpByJob.set(job.id, pair);
+          } else {
+            primaryOpByJob.set(job.id, null);
+          }
         }
       }
-
-      if (arr && Array.isArray(arr)) {
-        const pairs = arr.map((o) => ({ op: o.operation || o, itm: o.itemToMake || null }));
-        const primary = pickPrimaryOperation(job, pairs.map((p) => p.op));
-        const pair =
-          primary
-            ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null })
-            : null;
-        primaryOpByJob.set(job.id, pair);
-      } else {
-        primaryOpByJob.set(job.id, null);
-      }
+      const workers = Math.min(OPS_CONCURRENCY, Math.max(prefiltered.length, 1));
+      await Promise.all(Array.from({ length: workers }, worker));
     }
-  }
-
-  const workers = Math.min(OPS_CONCURRENCY, Math.max(prefiltered.length, 1));
-  await Promise.all(Array.from({ length: workers }, worker));
-}
-
 
     // 3) filter by schedule window (ops first, then job)
     const toMs = (d) => (d ? new Date(d).getTime() : NaN);
@@ -349,7 +344,6 @@ if (includeOps) {
       const pair = primaryOpByJob.get(j.id);
       const op   = pair?.op;
 
-      // for inclusion, consider either op or job dates
       const start =
         op?.scheduledStartUtc || op?.originalScheduledStartUtc ||
         j.scheduledStartUtc   || j.originalScheduledStartUtc   || j.productionDueDate;
@@ -379,7 +373,6 @@ if (includeOps) {
     const icsBody = events.map((e) => {
       const uid = crypto.createHash("sha1").update(`fulcrum:${e.id}`).digest("hex") + "@bettis";
       if (allDay) {
-        // derive date-only start & end (inclusive end)
         const startDate = e.start || e.end;
         const endDate   = e.end || e.start;
         return veventAllDay({
@@ -428,6 +421,15 @@ if (includeOps) {
   } catch (err) {
     res.status(500).send(`Error: ${err.message}`);
   }
+}
+
+/* -------------------- routes -------------------- */
+app.get("/calendar.ics", serveCalendar);
+
+// Always include equipment (ops=1) without requiring a query param
+app.get("/calendar-equip.ics", (req, res) => {
+  req.query = { ...req.query, ops: "1" };
+  return serveCalendar(req, res);
 });
 
 /* -------------------- test route -------------------- */
