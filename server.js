@@ -22,6 +22,10 @@ const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
 const DEFAULT_INCLUDE_OPS = process.env.DEFAULT_INCLUDE_OPS === "1";
 
+// Rolling window when s/u aren't provided
+const START_OFFSET_DAYS = Number(process.env.START_OFFSET_DAYS || -30);  // how far back
+const END_OFFSET_DAYS   = Number(process.env.END_OFFSET_DAYS   || 120);  // how far forward
+
 const OPS_CONCURRENCY = Number(process.env.OPS_CONCURRENCY || 8);
 const OPS_CACHE_TTL_MS = Number(process.env.OPS_CACHE_TTL_MS || 5 * 60 * 1000);
 
@@ -135,6 +139,58 @@ function finalizeIcs(ics) {
   if (!ics.endsWith("\r\n")) ics += "\r\n";
   return foldLines(ics);
 }
+
+function startOfUTC(dateLike) {
+    const d = new Date(dateLike);
+    d.setUTCHours(0,0,0,0);
+    return d;
+  }
+  function addDaysISO(dateLike, n) {
+    const d = new Date(dateLike);
+    d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString();
+  }
+  
+  // decide since/until based on query or rolling defaults
+  function resolveWindow(query) {
+    if (query.s && query.u) {
+      return { since: String(query.s), until: String(query.u), mode: "explicit" };
+    }
+  
+    // Optional “window” shorthand:
+    // ?window=month|quarter|year (you can keep or skip this block)
+    if (query.window) {
+      const now = new Date();
+      const y = now.getUTCFullYear();
+      const m = now.getUTCMonth();
+      if (query.window === "month") {
+        const since = new Date(Date.UTC(y, m, 1));
+        const until = new Date(Date.UTC(y, m + 1, 0)); // last day of month
+        return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
+      }
+      if (query.window === "quarter") {
+        const qStartM = Math.floor(m/3)*3;
+        const since = new Date(Date.UTC(y, qStartM, 1));
+        const until = new Date(Date.UTC(y, qStartM + 3, 0));
+        return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
+      }
+      if (query.window === "year") {
+        const since = new Date(Date.UTC(y, 0, 1));
+        const until = new Date(Date.UTC(y, 12, 0));
+        return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
+      }
+    }
+  
+    // Rolling default
+    const nowISO = new Date().toISOString();
+    const sinceISO = addDaysISO(startOfUTC(nowISO), START_OFFSET_DAYS);
+    const untilISO = addDaysISO(startOfUTC(nowISO), END_OFFSET_DAYS);
+    return {
+      since: sinceISO.slice(0,10),   // YYYY-MM-DD
+      until: untilISO.slice(0,10),   // YYYY-MM-DD
+      mode: "rolling"
+    };
+  }
 
 /* -------------------- API endpoints -------------------- */
 const JOBS_LIST = "/api/jobs/list";
@@ -256,8 +312,7 @@ async function serveCalendar(req, res) {
       return res.status(200).send(hit.body);
     }
 
-    const since = req.query.s;
-    const until = req.query.u;
+    const { since, until } = resolveWindow(req.query);
     const includeOps = req.query.ops === "1" || (req.query.ops == null && DEFAULT_INCLUDE_OPS);
     const allDay = req.query.allday !== "0"; // default ON
     const limit = parseInt(req.query.limit || "500", 10);
