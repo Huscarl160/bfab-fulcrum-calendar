@@ -1,16 +1,11 @@
 // server.js
-// Node 18+. package.json: { "type":"module", "scripts":{ "start":"node server.js" }, "engines":{ "node": ">=18" } }
-// Env:
-//   FULCRUM_TOKEN (required)                      - Fulcrum Pro JWT
+// Node 18+ (global fetch). package.json: { "type": "module", "start": "node server.js", "engines": { "node": ">=18" } }
+// Env vars:
+//   FULCRUM_TOKEN (required)
 //   FULCRUM_BASE (default: https://api.fulcrumpro.com)
-//   ACCESS_KEY (optional)                         - require ?key=...
-//   CACHE_TTL_SECONDS (default 60)                - per-URL ICS cache
-//   CREATED_WINDOW_BUFFER_DAYS (default 180)      - expands created window around s/u
-//   DEFAULT_INCLUDE_OPS ("1" to enable)           - default ops enrichment if ops not specified
-//   OPS_CONCURRENCY (default 8)                   - parallel op fetch workers
-//   OPS_CACHE_TTL_MS (default 300000)             - 5 minutes op cache
-//   START_OFFSET_DAYS (default -30)               - rolling window start offset (days from today)
-//   END_OFFSET_DAYS (default 120)                 - rolling window end offset (days from today)
+//   ACCESS_KEY (optional) require ?key=...
+//   CACHE_TTL_SECONDS (default: 60)
+//   CREATED_WINDOW_BUFFER_DAYS (default: 180)
 
 import express from "express";
 import crypto from "crypto";
@@ -22,26 +17,9 @@ const TOKEN = process.env.FULCRUM_TOKEN;
 const ACCESS_KEY = process.env.ACCESS_KEY || null;
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
-const DEFAULT_INCLUDE_OPS = process.env.DEFAULT_INCLUDE_OPS === "1";
 
-const OPS_CONCURRENCY = Number(process.env.OPS_CONCURRENCY || 8);
-const OPS_CACHE_TTL_MS = Number(process.env.OPS_CACHE_TTL_MS || 5 * 60 * 1000);
-
-// rolling window defaults
-const START_OFFSET_DAYS = Number(process.env.START_OFFSET_DAYS || -30);
-const END_OFFSET_DAYS   = Number(process.env.END_OFFSET_DAYS   || 120);
-
-// default: exclude completed
+// default statuses (exclude completed)
 const DEFAULT_STATUSES = ["scheduled", "inProgress"];
-
-// map friendly -> API enum
-const STATUS_MAP = new Map([
-  ["scheduled", "scheduled"], ["schedule", "scheduled"],
-  ["in-progress", "inProgress"], ["in_progress", "inProgress"], ["inprogress", "inProgress"],
-  ["pending", "pending"], ["awaiting", "pending"], ["queued", "pending"],
-  ["complete", "complete"], ["completed", "complete"],
-  ["cancelled", "cancelled"], ["canceled", "cancelled"],
-]);
 
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
@@ -50,8 +28,8 @@ if (!TOKEN) {
 
 /* -------------------- express -------------------- */
 const app = express();
-app.get("/", (_req, res) => res.send("OK"));
-app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get("/", (req, res) => res.send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 /* -------------------- helpers -------------------- */
 function icsEscape(s = "") {
@@ -62,62 +40,7 @@ function toUTC(dt) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
 }
-function yyyymmdd(dateLike) {
-  const d = new Date(dateLike);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
-}
-function addDaysISO(dateLike, n) {
-  const d = new Date(dateLike);
-  d.setUTCDate(d.getUTCDate() + n);
-  return d.toISOString();
-}
-function startOfUTC(dateLike) {
-  const d = new Date(dateLike);
-  d.setUTCHours(0, 0, 0, 0);
-  return d;
-}
-function resolveWindow(query) {
-  // explicit s/u wins
-  if (query.s && query.u) {
-    return { since: String(query.s), until: String(query.u), mode: "explicit" };
-  }
-
-  // optional shorthand window
-  if (query.window) {
-    const now = new Date();
-    const y = now.getUTCFullYear();
-    const m = now.getUTCMonth();
-    if (query.window === "month") {
-      const since = new Date(Date.UTC(y, m, 1));
-      const until = new Date(Date.UTC(y, m + 1, 0));
-      return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
-    }
-    if (query.window === "quarter") {
-      const qStartM = Math.floor(m/3)*3;
-      const since = new Date(Date.UTC(y, qStartM, 1));
-      const until = new Date(Date.UTC(y, qStartM + 3, 0));
-      return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
-    }
-    if (query.window === "year") {
-      const since = new Date(Date.UTC(y, 0, 1));
-      const until = new Date(Date.UTC(y, 12, 0));
-      return { since: since.toISOString().slice(0,10), until: until.toISOString().slice(0,10), mode: "window" };
-    }
-  }
-
-  // rolling default (today’s UTC midnight +/- offsets)
-  const nowISO = new Date().toISOString();
-  const sinceISO = addDaysISO(startOfUTC(nowISO), START_OFFSET_DAYS);
-  const untilISO = addDaysISO(startOfUTC(nowISO), END_OFFSET_DAYS);
-  return {
-    since: sinceISO.slice(0,10),
-    until: untilISO.slice(0,10),
-    mode: "rolling",
-  };
-}
-
-function veventTimed({ uid, start, end, summary, location, description, categories }) {
+function vevent({ uid, start, end, summary, location, description, categories }) {
   return [
     "BEGIN:VEVENT",
     `UID:${uid}`,
@@ -127,24 +50,7 @@ function veventTimed({ uid, start, end, summary, location, description, categori
     `SUMMARY:${icsEscape(summary || "Scheduled Work")}`,
     location ? `LOCATION:${icsEscape(location)}` : null,
     description ? `DESCRIPTION:${icsEscape(description)}` : null,
-    categories?.length ? `CATEGORIES:${categories.map(icsEscape).join(",")}` : null,
-    "END:VEVENT",
-  ].filter(Boolean).join("\r\n");
-}
-function veventAllDay({ uid, startDate, endDateInclusive, summary, location, description, categories }) {
-  // All-day: DTEND exclusive → add 1 day
-  const dtStart = yyyymmdd(startDate);
-  const dtEndExclusive = yyyymmdd(addDaysISO(endDateInclusive, 1));
-  return [
-    "BEGIN:VEVENT",
-    `UID:${uid}`,
-    `DTSTAMP:${toUTC(Date.now())}`,
-    `DTSTART;VALUE=DATE:${dtStart}`,
-    `DTEND;VALUE=DATE:${dtEndExclusive}`,
-    `SUMMARY:${icsEscape(summary || "Scheduled Work")}`,
-    location ? `LOCATION:${icsEscape(location)}` : null,
-    description ? `DESCRIPTION:${icsEscape(description)}` : null,
-    categories?.length ? `CATEGORIES:${categories.map(icsEscape).join(",")}` : null,
+    categories && categories.length ? `CATEGORIES:${categories.map(icsEscape).join(",")}` : null,
     "END:VEVENT",
   ].filter(Boolean).join("\r\n");
 }
@@ -162,12 +68,13 @@ async function postJson(path, body) {
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json();
 }
+
 function unwrapItems(raw) {
   if (Array.isArray(raw)) return raw;
   return raw?.items || raw?.results || raw?.data || [];
 }
 
-// RFC5545 75-octet folding
+// RFC5545 folding
 function foldLines(text) {
   const out = [];
   for (const line of text.split("\r\n")) {
@@ -187,11 +94,11 @@ function finalizeIcs(ics) {
   return foldLines(ics);
 }
 
-/* -------------------- API endpoints -------------------- */
+/* -------------------- API endpoints (declare ONCE) -------------------- */
 const JOBS_LIST = "/api/jobs/list";
 const JOB_OPS_LIST = (jobId) => `/api/jobs/${jobId}/operations/list`;
 
-/* -------------------- ops selection & mapping -------------------- */
+/* -------------------- ops selection & mapping for /calendar.ics -------------------- */
 function pickPrimaryOperation(job, ops) {
   if (!Array.isArray(ops) || ops.length === 0) return null;
   const jStart = new Date(job.scheduledStartUtc || job.originalScheduledStartUtc || job.productionDueDate || 0).getTime();
@@ -199,7 +106,11 @@ function pickPrimaryOperation(job, ops) {
 
   const candidates = ops
     .filter((o) => o?.scheduledStartUtc || o?.originalScheduledStartUtc)
-    .sort((a, b) => new Date(a.scheduledStartUtc || a.originalScheduledStartUtc) - new Date(b.scheduledStartUtc || b.originalScheduledStartUtc));
+    .sort((a, b) => {
+      const as = new Date(a.scheduledStartUtc || a.originalScheduledStartUtc).getTime();
+      const bs = new Date(b.scheduledStartUtc || b.originalScheduledStartUtc).getTime();
+      return as - bs;
+    });
 
   if (!candidates.length) return null;
   if (jStart) {
@@ -214,16 +125,15 @@ function pickPrimaryOperation(job, ops) {
 }
 
 function mapJobToEvent(job, primaryOp, itemToMake) {
-  // Use job-level window for all-day; fall back to operation if needed
   const jobStart = job.scheduledStartUtc || job.originalScheduledStartUtc || job.productionDueDate;
-  const jobEnd   = job.scheduledEndUtc   || job.originalScheduledEndUtc;
+  const jobEnd = job.scheduledEndUtc || job.originalScheduledEndUtc;
 
-  const opStart  = primaryOp?.scheduledStartUtc || primaryOp?.originalScheduledStartUtc;
-  const opEnd    = primaryOp?.scheduledEndUtc   || primaryOp?.originalScheduledEndUtc;
+  const opStart = primaryOp?.scheduledStartUtc || primaryOp?.originalScheduledStartUtc;
+  const opEnd = primaryOp?.scheduledEndUtc || primaryOp?.originalScheduledEndUtc;
 
-  const start = jobStart || opStart;
-  let end = jobEnd || opEnd || start;
-  if (!end && start) end = addDaysISO(start, 1);
+  const start = opStart || jobStart;
+  let end = opEnd || jobEnd;
+  if (!end && start) end = new Date(new Date(start).getTime() + 30 * 60 * 1000).toISOString();
 
   const title = job.name || (job.number != null ? `Job #${job.number}` : "Scheduled Work");
   const number = job.number != null ? `#${job.number}` : "";
@@ -259,40 +169,20 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
     end,
     summary,
     location,
-    description: descLines.join("\\n"),
+    description: descLines.join("\\n"), // escaped later
     categories,
   };
 }
 
-/* -------------------- tiny per-URL ICS cache -------------------- */
+/* -------------------- tiny per-URL cache -------------------- */
 const cache = new Map(); // key: req.url -> { at, body, etag }
 
-/* -------------------- ops result cache -------------------- */
-const opsCache = new Map(); // jobId -> { at, data:Array }
-function cacheGetOps(jobId) {
-  const hit = opsCache.get(jobId);
-  if (!hit) return null;
-  if (Date.now() - hit.at > OPS_CACHE_TTL_MS) {
-    opsCache.delete(jobId);
-    return null;
-  }
-  return hit.data;
-}
-function cachePutOps(jobId, data) {
-  opsCache.set(jobId, { at: Date.now(), data });
-  if (opsCache.size > 500) {
-    const oldestKey = [...opsCache.entries()].sort((a, b) => a[1].at - b[1].at)[0][0];
-    opsCache.delete(oldestKey);
-  }
-}
-
-/* -------------------- core handler -------------------- */
-// /calendar.ics?[s=YYYY-MM-DD&u=YYYY-MM-DD][&window=month|quarter|year][&ops=1][&allday=0][&statuses=scheduled,in-progress,pending]
-async function serveCalendar(req, res) {
+/* -------------------- JOB-DRIVEN ICS -------------------- */
+// /calendar.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&ops=1&statuses=scheduled,in-progress
+app.get("/calendar.ics", async (req, res) => {
   try {
     if (ACCESS_KEY && req.query.key !== ACCESS_KEY) return res.sendStatus(403);
 
-    // cache read
     const key = req.url;
     const now = Date.now();
     const hit = cache.get(key);
@@ -306,83 +196,50 @@ async function serveCalendar(req, res) {
       return res.status(200).send(hit.body);
     }
 
-    const { since, until } = resolveWindow(req.query);
-    const includeOps = req.query.ops === "1" || (req.query.ops == null && DEFAULT_INCLUDE_OPS);
-    const allDay = req.query.allday !== "0"; // default ON
+    const since = req.query.s;
+    const until = req.query.u;
+    const includeOps = req.query.ops === "1";
     const limit = parseInt(req.query.limit || "500", 10);
 
-    // statuses -> normalize to API enums
-    const rawStatuses = req.query.statuses
+    const statuses = req.query.statuses
       ? String(req.query.statuses).split(",").map(s => s.trim()).filter(Boolean)
       : DEFAULT_STATUSES.slice();
-    const mapped = rawStatuses.map(s => STATUS_MAP.get(s.toLowerCase?.() || s)).filter(Boolean);
-    const finalStatuses = mapped.length ? mapped : DEFAULT_STATUSES.slice();
 
-    // created-window buffering -> server-side list
+    const addDays = (dateLike, n) => {
+      const x = new Date(dateLike);
+      x.setUTCDate(x.getUTCDate() + n);
+      return x.toISOString();
+    };
     let createdAfterUtc, createdBeforeUtc;
-    if (since) createdAfterUtc = addDaysISO(since, -CREATED_WINDOW_BUFFER_DAYS);
-    if (until) createdBeforeUtc = addDaysISO(until,  CREATED_WINDOW_BUFFER_DAYS);
+    if (since) createdAfterUtc = addDays(since, -CREATED_WINDOW_BUFFER_DAYS);
+    if (until) createdBeforeUtc = addDays(until,  CREATED_WINDOW_BUFFER_DAYS);
 
     const listBody = { limit };
-    if (finalStatuses.length === 1) listBody.status = finalStatuses[0];
-    else if (finalStatuses.length > 1) listBody.statuses = finalStatuses;
+    if (statuses?.length) listBody.statuses = statuses;
     if (createdAfterUtc)  listBody.createdAfterUtc  = createdAfterUtc;
     if (createdBeforeUtc) listBody.createdBeforeUtc = createdBeforeUtc;
 
-    // 1) list jobs
     const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
-    // 2) optionally fetch operations (prefilter + parallel + cache)
     const primaryOpByJob = new Map();
-    if (includeOps && jobs.length) {
-      const sMs = since ? new Date(since).getTime() : null;
-      const uMs = until ? new Date(until).getTime() : null;
-      const prefiltered = jobs.filter((j) => {
-        const start = j.scheduledStartUtc || j.originalScheduledStartUtc || j.productionDueDate;
-        const end   = j.scheduledEndUtc   || j.originalScheduledEndUtc || start;
-        if (!start) return false;
-        const js = new Date(start).getTime();
-        const je = new Date(end).getTime();
-        if (sMs && je < sMs) return false;
-        if (uMs && js > uMs) return false;
-        return true;
-      });
-
-      let idx = 0;
-      async function worker() {
-        while (idx < prefiltered.length) {
-          const i = idx++;
-          const job = prefiltered[i];
-
-          let arr = cacheGetOps(job.id);
-          if (!arr) {
-            try {
-              const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 200 });
-              arr = unwrapItems(opsResp);
-              cachePutOps(job.id, arr);
-            } catch {
-              arr = null;
-            }
-          }
-
-          if (arr && Array.isArray(arr)) {
-            const pairs = arr.map((o) => ({ op: o.operation || o, itm: o.itemToMake || null }));
-            const primary = pickPrimaryOperation(job, pairs.map((p) => p.op));
-            const pair = primary
-              ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null })
-              : null;
-            primaryOpByJob.set(job.id, pair);
-          } else {
-            primaryOpByJob.set(job.id, null);
-          }
+    if (includeOps) {
+      for (const job of jobs) {
+        try {
+          const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 200 });
+          const arr = unwrapItems(opsResp);
+          const pairs = arr.map((o) => ({ op: o.operation || o, itm: o.itemToMake || null }));
+          const primary = pickPrimaryOperation(job, pairs.map((p) => p.op));
+          const pair = primary
+            ? (pairs.find((p) => p.op?.id === primary.id) || { op: primary, itm: null })
+            : null;
+          primaryOpByJob.set(job.id, pair);
+        } catch {
+          primaryOpByJob.set(job.id, null);
         }
       }
-      const workers = Math.min(OPS_CONCURRENCY, Math.max(prefiltered.length, 1));
-      await Promise.all(Array.from({ length: workers }, worker));
     }
 
-    // 3) filter by schedule window (ops first, then job)
     const toMs = (d) => (d ? new Date(d).getTime() : NaN);
     const winStart = since ? new Date(since).getTime() : null;
     const winEnd   = until ? new Date(until).getTime() : null;
@@ -416,34 +273,6 @@ async function serveCalendar(req, res) {
       return mapJobToEvent(j, primaryOp, itemToMake);
     });
 
-    // 4) build ICS (all-day by default)
-    const icsBody = events.map((e) => {
-      const uid = crypto.createHash("sha1").update(`fulcrum:${e.id}`).digest("hex") + "@bettis";
-      if (allDay) {
-        const startDate = e.start || e.end;
-        const endDate   = e.end || e.start;
-        return veventAllDay({
-          uid,
-          startDate,
-          endDateInclusive: endDate,
-          summary: e.summary,
-          location: e.location,
-          description: e.description,
-          categories: e.categories,
-        });
-      } else {
-        return veventTimed({
-          uid,
-          start: e.start,
-          end: e.end,
-          summary: e.summary,
-          location: e.location,
-          description: e.description,
-          categories: e.categories,
-        });
-      }
-    }).join("\r\n");
-
     const ics = [
       "BEGIN:VCALENDAR",
       "VERSION:2.0",
@@ -452,11 +281,22 @@ async function serveCalendar(req, res) {
       "METHOD:PUBLISH",
       "X-WR-CALNAME:Fulcrum Schedule",
       "X-WR-TIMEZONE:UTC",
-      icsBody,
+      ...events.map((e) =>
+        vevent({
+          uid: crypto.createHash("sha1").update(`fulcrum:${e.id}`).digest("hex") + "@bettis",
+          start: e.start,
+          end: e.end,
+          summary: e.summary,
+          location: e.location,
+          description: e.description,
+          categories: e.categories,
+        })
+      ),
       "END:VCALENDAR",
     ].join("\r\n");
 
     const safeIcs = finalizeIcs(ics);
+
     const etag = 'W/"' + crypto.createHash("sha1").update(safeIcs).digest("hex") + '"';
     cache.set(key, { at: now, body: safeIcs, etag });
 
@@ -468,26 +308,11 @@ async function serveCalendar(req, res) {
   } catch (err) {
     res.status(500).send(`Error: ${err.message}`);
   }
-}
-
-/* -------------------- routes -------------------- */
-app.get("/calendar.ics", serveCalendar);
-
-// Always include equipment (ops=1) without requiring a query param
-app.get("/calendar-equip.ics", (req, res) => {
-  req.query = { ...req.query, ops: "1" };
-  return serveCalendar(req, res);
 });
 
-/* -------------------- OPS-DRIVEN ICS ROUTE -------------------- */
+/* -------------------- OPS-DRIVEN ICS -------------------- */
 // /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&statuses=scheduled,inProgress,ready,pending,paused
-// Defaults: rolling window [today-30d, today+120d], allday=0, statuses exclude "complete"
-
-const JOBS_LIST = "/api/jobs/list";
-const JOB_OPS_LIST = (jobId) => `/api/jobs/${jobId}/operations/list`;
-
 function parseISODateOnly(s) {
-  // Accept "YYYY-MM-DD" or any ISO; return millis or null
   if (!s) return null;
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d.getTime();
@@ -516,7 +341,6 @@ app.get("/calendar-ops.ics", async (req, res) => {
   try {
     if (ACCESS_KEY && req.query.key !== ACCESS_KEY) return res.sendStatus(403);
 
-    // Cache
     const key = req.url;
     const now = Date.now();
     const hit = cache.get(key);
@@ -530,8 +354,7 @@ app.get("/calendar-ops.ics", async (req, res) => {
       return res.status(200).send(hit.body);
     }
 
-    // ---- Query params ----
-    // Window: default [today-30d, today+120d] if not provided
+    // default rolling window: today-30d .. today+120d
     const today = new Date();
     const defStart = addDaysMillis(today.getTime(), -30);
     const defEnd   = addDaysMillis(today.getTime(), +120);
@@ -539,10 +362,8 @@ app.get("/calendar-ops.ics", async (req, res) => {
     const winStart = parseISODateOnly(req.query.s) ?? defStart;
     const winEnd   = parseISODateOnly(req.query.u) ?? defEnd;
 
-    // allday=1 → all-day events; else precise times
     const allDay = String(req.query.allday || "0") === "1";
 
-    // Operation statuses to include (default excludes 'complete')
     const defaultOpStatuses = ["scheduled","inProgress","ready","pending","paused"];
     const opStatuses = req.query.statuses
       ? String(req.query.statuses).split(",").map(s => s.trim()).filter(Boolean)
@@ -550,23 +371,20 @@ app.get("/calendar-ops.ics", async (req, res) => {
 
     const limit = parseInt(req.query.limit || "500", 10);
 
-    // ---- Server-side throttle via job created window ----
     const bufferDays = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
     const createdAfterUtc  = new Date(addDaysMillis(winStart, -bufferDays)).toISOString();
     const createdBeforeUtc = new Date(addDaysMillis(winEnd,   +bufferDays)).toISOString();
 
     const listBody = {
       limit,
-      statuses: ["scheduled","inProgress","pending","ready","paused"], // job statuses to pull
+      statuses: ["scheduled","inProgress","pending","ready","paused"],
       createdAfterUtc,
       createdBeforeUtc,
     };
 
-    // 1) Jobs
     const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
-    // 2) Ops per job
     const rows = [];
     for (const j of jobs) {
       if (!j?.id) continue;
@@ -577,31 +395,24 @@ app.get("/calendar-ops.ics", async (req, res) => {
           const op = row.operation || row;
           const itm = row.itemToMake || {};
           const { start, end } = pickOpTimes(op);
-
-          // Skip if no scheduling at all
           if (!start && !end) continue;
 
-          // Window filter (overlap check)
           const s = start ?? end;
-          const e = end ?? (start ? addDaysMillis(start, 0) : null);
+          const e = end ?? (start || null);
           if (s == null) continue;
           const overlaps = (e ?? s) >= winStart && s <= winEnd;
           if (!overlaps) continue;
 
-          // Status filter (operation-level)
           const opStatus = String(op.status || "").trim();
           if (opStatuses.length && !opStatuses.includes(opStatus)) continue;
 
-          // Build event fields
           const title  = j.name || (j.number != null ? `Job #${j.number}` : "Operation");
           const number = j.number != null ? `#${j.number}` : "";
           const opName = op.name || "";
           const equip  = op.scheduledEquipmentName || "";
 
           const summary = [title, number, opName ? `(${opName})` : ""].filter(Boolean).join(" ");
-
-          const itemName =
-            itm?.itemReference?.name || itm?.itemReference?.number || "";
+          const itemName = itm?.itemReference?.name || itm?.itemReference?.number || "";
           const descLines = [
             opStatus ? `Status: ${opStatus}` : null,
             equip    ? `Equipment: ${equip}` : null,
@@ -616,16 +427,15 @@ app.get("/calendar-ops.ics", async (req, res) => {
             location: equip || "",
             description: descLines.join("\\n"),
             categories: [equip || null, opName || null, opStatus || null].filter(Boolean),
-            startMs: start ?? s,
-            endMs: end ?? (start ? addDaysMillis(start, 0) : s),
+            startMs: s,
+            endMs: e ?? (s + 30*60*1000),
           });
         }
       } catch {
-        // swallow per-job failures
+        // ignore per-job failures
       }
     }
 
-    // 3) Build ICS (all-day or timed)
     const lines = [
       "BEGIN:VCALENDAR",
       "VERSION:2.0",
@@ -638,13 +448,12 @@ app.get("/calendar-ops.ics", async (req, res) => {
 
     for (const e of rows) {
       if (allDay) {
-        // DTSTART/DTEND date-only; DTEND is exclusive → add 1 day
         const startDate = new Date(e.startMs);
         const endDateExclusive = new Date(addDaysMillis(e.endMs || e.startMs, 1));
         lines.push(
           "BEGIN:VEVENT",
           `UID:${e.uid}`,
-          `DTSTAMP:${toUTCTimestamp(Date.now())}`,
+          `DTSTAMP:${toUTC(Date.now())}`,
           `DTSTART;VALUE=DATE:${toUTCDateOnly(startDate)}`,
           `DTEND;VALUE=DATE:${toUTCDateOnly(endDateExclusive)}`,
           `SUMMARY:${icsEscape(e.summary)}`,
@@ -657,9 +466,9 @@ app.get("/calendar-ops.ics", async (req, res) => {
         lines.push(
           "BEGIN:VEVENT",
           `UID:${e.uid}`,
-          `DTSTAMP:${toUTCTimestamp(Date.now())}`,
-          `DTSTART:${toUTCTimestamp(e.startMs)}`,
-          `DTEND:${toUTCTimestamp(e.endMs || (e.startMs + 30*60*1000))}`,
+          `DTSTAMP:${toUTC(Date.now())}`,
+          `DTSTART:${toUTC(e.startMs)}`,
+          `DTEND:${toUTC(e.endMs)}`,
           `SUMMARY:${icsEscape(e.summary)}`,
           e.location ? `LOCATION:${icsEscape(e.location)}` : null,
           e.description ? `DESCRIPTION:${icsEscape(e.description)}` : null,
@@ -686,14 +495,10 @@ app.get("/calendar-ops.ics", async (req, res) => {
   }
 });
 
-
-
-/* -------------------- test route -------------------- */
-app.get("/test.ics", (_req, res) => {
+/* -------------------- test -------------------- */
+app.get("/test.ics", (req, res) => {
   const now = new Date();
   const in30 = new Date(now.getTime() + 30 * 60 * 1000);
-  const pad = (n) => String(n).padStart(2, "0");
-  const toUTC = (d) => `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
   const ics = [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
@@ -708,10 +513,11 @@ app.get("/test.ics", (_req, res) => {
     `DTSTART:${toUTC(now)}`,
     `DTEND:${toUTC(in30)}`,
     "SUMMARY:Test Event (should appear today)",
-    "DESCRIPTION:Diagnostic event to confirm Outlook rendering.",
+    "DESCRIPTION:This is a diagnostic VEVENT\\nIf you can see this, Outlook is rendering.",
     "END:VEVENT",
     "END:VCALENDAR",
   ].join("\r\n") + "\r\n";
+
   res.setHeader("Content-Type", "text/calendar; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
   res.status(200).send(ics);
