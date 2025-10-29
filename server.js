@@ -292,8 +292,14 @@ app.get("/calendar.ics", async (req, res) => {
       return res.status(200).send(hit.body);
     }
 
-    const since = req.query.s;
-    const until = req.query.u;
+    // Windowing: if not supplied, default to [today-30d, today+180d]
+    const today = new Date();
+    const startDefault = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 30));
+    const endDefault   = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 180));
+
+    const since = req.query.s || startDefault.toISOString().slice(0, 10); // YYYY-MM-DD
+    const until = req.query.u || endDefault.toISOString().slice(0, 10);   // YYYY-MM-DD
+
     const includeOps = req.query.ops === "1";
     const limit = parseInt(req.query.limit || "500", 10);
 
@@ -626,99 +632,78 @@ app.get("/test.ics", (req, res) => {
 
 /* -------------------- feeds index (operation-specific ICS links) -------------------- */
 
-// Master list of operation names exactly as they appear in Fulcrum
+// --- Simple feeds directory (HTML + JSON) ---
+// Canonical list of operation "slugs" -> display name.
+// Add/remove rows here as your shop’s ops evolve.
 const OP_FEEDS = [
-  "Saw",
-  "Drill",
-  "Plasma Cut",
-  "Laser Cut",
-  "OS Processing",
-  "Shear",
-  "Flex",
-  "Press Brake",
-  "Cobot Weld",
-  "Weld",
-  "Sand Blast / Clean",
-  "Paint",
-  "Repair",
-  "Trucking",
-  "Assemble",
-  "CAD / Engineering",
-  "Deburr / De-Slag",
-  "Packaging",
-  "Office / OH / Burden",
+  // Cutting
+  { slug: "laser-cut",   name: "Laser Cut" },
+  { slug: "plasma-cut",  name: "Plasma Cut" },
+  { slug: "saw",         name: "Saw" },
+  { slug: "shear",       name: "Shear" },
+
+  // Forming
+  { slug: "press-brake", name: "Press Brake" },
+  { slug: "flex",        name: "Flex" },
+
+  // Welding/Finishing
+  { slug: "weld",        name: "Weld" },
+  { slug: "sandblast",   name: "Sand Blast / Clean" },
+  { slug: "paint",       name: "Paint" },
+  { slug: "packaging",   name: "Packaging" },
+
+  // Engineering / Admin / Logistics
+  { slug: "cad",         name: "CAD / Engineering" },
+  { slug: "office",      name: "Office / OH / Burden" },
+  { slug: "trucking",    name: "Trucking" },
 ];
 
-// Suggest Outlook/SharePoint colors per op (totally optional—edit to taste)
-const FEED_COLORS = {
-  "Saw": "#3b82f6",
-  "Drill": "#0ea5e9",
-  "Plasma Cut": "#06b6d4",
-  "Laser Cut": "#14b8a6",
-  "OS Processing": "#22c55e",
-  "Shear": "#84cc16",
-  "Flex": "#a3e635",
-  "Press Brake": "#eab308",
-  "Cobot Weld": "#f59e0b",
-  "Weld": "#f97316",
-  "Sand Blast / Clean": "#ef4444",
-  "Paint": "#dc2626",
-  "Repair": "#b91c1c",
-  "Trucking": "#8b5cf6",
-  "Assemble": "#6366f1",
-  "CAD / Engineering": "#4f46e5",
-  "Deburr / De-Slag": "#7c3aed",
-  "Packaging": "#db2777",
-  "Office / OH / Burden": "#475569",
-};
-
-function buildBaseUrl(req) {
-  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
-  const host = req.get("host");
-  return `${proto}://${host}`;
+// Map an op slug to the exact operation name used in Fulcrum
+function opSlugToOpName(slug) {
+  const found = OP_FEEDS.find(f => f.slug === slug);
+  return found ? found.name : slug;
 }
 
-// JSON version if you want to wire anything else up later
-app.get("/feeds.json", (req, res) => {
-  const base = buildBaseUrl(req);
-  const defaultParams =
-    "allday=1&statuses=scheduled,inProgress,ready,pending,paused";
-  const items = OP_FEEDS.map((name) => {
-    const url =
-      `${base}/calendar-ops.ics?${defaultParams}&opNames=` +
-      encodeURIComponent(name);
-    return {
-      operation: name,
-      url,
-      color: FEED_COLORS[name] || "#64748b",
-    };
+// Build a stable, evergreen URL for this op
+function opFeedUrl(req, slug) {
+  const base = `${req.protocol}://${req.get("host")}/calendar-ops.ics`;
+  // Evergreen params:
+  // - allday=1 to keep all-day presentation
+  // - statuses only for OPS (client-side filtered), we do NOT pass job statuses to list() to avoid 400s
+  // - op=<Fulcrum operation display name>, URL-encoded
+  const params = new URLSearchParams({
+    allday: "1",
+    limit: "500",
+    statuses: "ready,pending,inProgress,paused",
+    op: opSlugToOpName(slug),
+    // purposely omit s/u so the route uses its dynamic defaults
   });
-  res.json({ feeds: items });
+  if (ACCESS_KEY) params.set("key", ACCESS_KEY);
+  return `${base}?${params.toString()}`;
+}
+
+// JSON for automation
+app.get("/feeds.json", (req, res) => {
+  const items = OP_FEEDS.map(f => ({
+    slug: f.slug,
+    name: f.name,
+    url: opFeedUrl(req, f.slug),
+  }));
+  res.json({ items });
 });
 
-// Pretty HTML index with copy buttons
+// Minimal HTML directory (no external scripts; inline CSS is okay)
 app.get("/feeds", (req, res) => {
-  const base = buildBaseUrl(req);
-  const defaultParams =
-    "allday=1&statuses=scheduled,inProgress,ready,pending,paused";
-
-  const rows = OP_FEEDS.map((name) => {
-    const url =
-      `${base}/calendar-ops.ics?${defaultParams}&opNames=` +
-      encodeURIComponent(name);
-    const color = FEED_COLORS[name] || "#64748b";
+  const rows = OP_FEEDS.map(f => {
+    const url = opFeedUrl(req, f.slug);
     return `
       <tr>
-        <td class="op">
-          <span class="dot" style="background:${color}"></span>
-          ${name}
-        </td>
-        <td class="url">
-          <input type="text" readonly value="${url}">
-        </td>
-        <td class="actions">
-          <button data-url="${url}">Copy</button>
-          <a class="open" href="${url}" target="_blank" rel="noopener">Open</a>
+        <td>${f.name}</td>
+        <td><code>${f.slug}</code></td>
+        <td><a href="${url}" target="_blank" rel="noopener">Open ICS</a></td>
+        <td>
+          <input style="width: 100%" value="${url}" readonly
+                 onclick="this.select(); document.execCommand('copy');">
         </td>
       </tr>`;
   }).join("");
@@ -730,67 +715,36 @@ app.get("/feeds", (req, res) => {
 <title>Fulcrum Operation Feeds</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root { --bg:#0b1220; --panel:#0f172a; --text:#e5e7eb; --muted:#94a3b8; --accent:#22d3ee; --br:14px; }
-  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; background:var(--bg); color:var(--text); }
-  .wrap { max-width: 1100px; margin: 40px auto; padding: 24px; }
-  .card { background:var(--panel); border-radius:var(--br); padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
-  h1 { margin:0 0 6px 0; font-size: 28px; letter-spacing: .3px; }
-  p.sub { margin: 0 0 16px 0; color: var(--muted); }
-  .tip { font-size: 14px; color: var(--muted); margin-bottom: 18px; }
-  table { width:100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 10px 12px; vertical-align: middle; }
-  th { color:#cbd5e1; font-weight: 600; border-bottom: 1px solid #1f2937; }
-  tr + tr td { border-top: 1px dashed #1f2937; }
-  .op { white-space: nowrap; }
-  .dot { display:inline-block; width:12px; height:12px; border-radius: 999px; margin-right:8px; vertical-align: -1px; }
-  .url input { width:100%; background:#0b1020; color:#e2e8f0; border:1px solid #1f2937; border-radius:8px; padding:8px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 13px; }
-  .actions { white-space: nowrap; }
-  button, a.open {
-    display:inline-block; margin-right: 8px; padding: 8px 12px; border-radius: 10px; border: 1px solid #1f2937;
-    background: #0b1020; color: #e2e8f0; text-decoration: none; font-weight: 600; font-size: 13px;
-  }
-  button:hover, a.open:hover { border-color: var(--accent); color: #ecfeff; }
-  .footer { margin-top: 12px; font-size: 13px; color: var(--muted); }
-  .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; background:#111827; border:1px solid #1f2937; padding:2px 6px; border-radius:6px; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 0.6rem; vertical-align: top; }
+  th { background: #f5f5f5; text-align: left; }
+  code { background: #f2f4f8; padding: 0.1rem 0.3rem; border-radius: 4px; }
+  .tip { margin-bottom: 1rem; }
 </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <h1>Fulcrum Operation Feeds</h1>
-      <p class="sub">Subscribe to operation-specific ICS feeds (all-day; auto-refreshed range; suggested colors included).</p>
-      <div class="tip">Tip: In Outlook, use <span class="kbd">Add calendar → Subscribe from web</span>,
-      paste a URL, and assign a color. These feeds use <span class="kbd">allday=1</span> and include statuses <span class="kbd">scheduled,inProgress,ready,pending,paused</span>.</div>
-      <table>
-        <thead>
-          <tr><th>Operation</th><th>URL</th><th>Actions</th></tr>
-        </thead>
-        <tbody>
-          ${rows}
-        </tbody>
-      </table>
-      <div class="footer">Base URL: <span class="kbd">${base}</span></div>
-    </div>
-  </div>
-<script>
-  document.addEventListener("click", async (e) => {
-    if (e.target.matches("button[data-url]")) {
-      const url = e.target.getAttribute("data-url");
-      try {
-        await navigator.clipboard.writeText(url);
-        e.target.textContent = "Copied!";
-        setTimeout(() => (e.target.textContent = "Copy"), 1200);
-      } catch {
-        prompt("Copy URL:", url);
-      }
-    }
-  });
-</script>
+  <h1>Fulcrum Operation Feeds</h1>
+  <p class="tip">
+    Click a feed’s <em>Open ICS</em> to preview, or copy the URL into Outlook → Add calendar → Subscribe from web.
+  </p>
+  <table>
+    <thead>
+      <tr><th>Operation</th><th>Slug</th><th>Preview</th><th>Subscription URL</th></tr>
+    </thead>
+    <tbody>
+      ${rows}
+    </tbody>
+  </table>
+  <p class="tip">
+    JSON: <a href="/feeds.json">/feeds.json</a>
+  </p>
 </body>
 </html>`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.status(200).send(html);
+  res.send(html);
 });
+
 
 
 /* -------------------- start -------------------- */
