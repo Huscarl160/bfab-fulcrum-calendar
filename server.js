@@ -624,6 +624,175 @@ app.get("/test.ics", (req, res) => {
   res.status(200).send(ics);
 });
 
+/* -------------------- feeds index (operation-specific ICS links) -------------------- */
+
+// Master list of operation names exactly as they appear in Fulcrum
+const OP_FEEDS = [
+  "Saw",
+  "Drill",
+  "Plasma Cut",
+  "Laser Cut",
+  "OS Processing",
+  "Shear",
+  "Flex",
+  "Press Brake",
+  "Cobot Weld",
+  "Weld",
+  "Sand Blast / Clean",
+  "Paint",
+  "Repair",
+  "Trucking",
+  "Assemble",
+  "CAD / Engineering",
+  "Deburr / De-Slag",
+  "Packaging",
+  "Office / OH / Burden",
+];
+
+// Suggest Outlook/SharePoint colors per op (totally optional—edit to taste)
+const FEED_COLORS = {
+  "Saw": "#3b82f6",
+  "Drill": "#0ea5e9",
+  "Plasma Cut": "#06b6d4",
+  "Laser Cut": "#14b8a6",
+  "OS Processing": "#22c55e",
+  "Shear": "#84cc16",
+  "Flex": "#a3e635",
+  "Press Brake": "#eab308",
+  "Cobot Weld": "#f59e0b",
+  "Weld": "#f97316",
+  "Sand Blast / Clean": "#ef4444",
+  "Paint": "#dc2626",
+  "Repair": "#b91c1c",
+  "Trucking": "#8b5cf6",
+  "Assemble": "#6366f1",
+  "CAD / Engineering": "#4f46e5",
+  "Deburr / De-Slag": "#7c3aed",
+  "Packaging": "#db2777",
+  "Office / OH / Burden": "#475569",
+};
+
+function buildBaseUrl(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.get("host");
+  return `${proto}://${host}`;
+}
+
+// JSON version if you want to wire anything else up later
+app.get("/feeds.json", (req, res) => {
+  const base = buildBaseUrl(req);
+  const defaultParams =
+    "allday=1&statuses=scheduled,inProgress,ready,pending,paused";
+  const items = OP_FEEDS.map((name) => {
+    const url =
+      `${base}/calendar-ops.ics?${defaultParams}&opNames=` +
+      encodeURIComponent(name);
+    return {
+      operation: name,
+      url,
+      color: FEED_COLORS[name] || "#64748b",
+    };
+  });
+  res.json({ feeds: items });
+});
+
+// Pretty HTML index with copy buttons
+app.get("/feeds", (req, res) => {
+  const base = buildBaseUrl(req);
+  const defaultParams =
+    "allday=1&statuses=scheduled,inProgress,ready,pending,paused";
+
+  const rows = OP_FEEDS.map((name) => {
+    const url =
+      `${base}/calendar-ops.ics?${defaultParams}&opNames=` +
+      encodeURIComponent(name);
+    const color = FEED_COLORS[name] || "#64748b";
+    return `
+      <tr>
+        <td class="op">
+          <span class="dot" style="background:${color}"></span>
+          ${name}
+        </td>
+        <td class="url">
+          <input type="text" readonly value="${url}">
+        </td>
+        <td class="actions">
+          <button data-url="${url}">Copy</button>
+          <a class="open" href="${url}" target="_blank" rel="noopener">Open</a>
+        </td>
+      </tr>`;
+  }).join("");
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fulcrum Operation Feeds</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0b1220; --panel:#0f172a; --text:#e5e7eb; --muted:#94a3b8; --accent:#22d3ee; --br:14px; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; background:var(--bg); color:var(--text); }
+  .wrap { max-width: 1100px; margin: 40px auto; padding: 24px; }
+  .card { background:var(--panel); border-radius:var(--br); padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+  h1 { margin:0 0 6px 0; font-size: 28px; letter-spacing: .3px; }
+  p.sub { margin: 0 0 16px 0; color: var(--muted); }
+  .tip { font-size: 14px; color: var(--muted); margin-bottom: 18px; }
+  table { width:100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 12px; vertical-align: middle; }
+  th { color:#cbd5e1; font-weight: 600; border-bottom: 1px solid #1f2937; }
+  tr + tr td { border-top: 1px dashed #1f2937; }
+  .op { white-space: nowrap; }
+  .dot { display:inline-block; width:12px; height:12px; border-radius: 999px; margin-right:8px; vertical-align: -1px; }
+  .url input { width:100%; background:#0b1020; color:#e2e8f0; border:1px solid #1f2937; border-radius:8px; padding:8px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 13px; }
+  .actions { white-space: nowrap; }
+  button, a.open {
+    display:inline-block; margin-right: 8px; padding: 8px 12px; border-radius: 10px; border: 1px solid #1f2937;
+    background: #0b1020; color: #e2e8f0; text-decoration: none; font-weight: 600; font-size: 13px;
+  }
+  button:hover, a.open:hover { border-color: var(--accent); color: #ecfeff; }
+  .footer { margin-top: 12px; font-size: 13px; color: var(--muted); }
+  .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; background:#111827; border:1px solid #1f2937; padding:2px 6px; border-radius:6px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Fulcrum Operation Feeds</h1>
+      <p class="sub">Subscribe to operation-specific ICS feeds (all-day; auto-refreshed range; suggested colors included).</p>
+      <div class="tip">Tip: In Outlook, use <span class="kbd">Add calendar → Subscribe from web</span>,
+      paste a URL, and assign a color. These feeds use <span class="kbd">allday=1</span> and include statuses <span class="kbd">scheduled,inProgress,ready,pending,paused</span>.</div>
+      <table>
+        <thead>
+          <tr><th>Operation</th><th>URL</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+      <div class="footer">Base URL: <span class="kbd">${base}</span></div>
+    </div>
+  </div>
+<script>
+  document.addEventListener("click", async (e) => {
+    if (e.target.matches("button[data-url]")) {
+      const url = e.target.getAttribute("data-url");
+      try {
+        await navigator.clipboard.writeText(url);
+        e.target.textContent = "Copied!";
+        setTimeout(() => (e.target.textContent = "Copy"), 1200);
+      } catch {
+        prompt("Copy URL:", url);
+      }
+    }
+  });
+</script>
+</body>
+</html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.status(200).send(html);
+});
+
+
 /* -------------------- start -------------------- */
 app.listen(PORT, () => {
   console.log(`ICS feed running on :${PORT}`);
