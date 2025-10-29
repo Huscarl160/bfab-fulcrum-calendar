@@ -479,6 +479,215 @@ app.get("/calendar-equip.ics", (req, res) => {
   return serveCalendar(req, res);
 });
 
+/* -------------------- OPS-DRIVEN ICS ROUTE -------------------- */
+// /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&statuses=scheduled,inProgress,ready,pending,paused
+// Defaults: rolling window [today-30d, today+120d], allday=0, statuses exclude "complete"
+
+const JOBS_LIST = "/api/jobs/list";
+const JOB_OPS_LIST = (jobId) => `/api/jobs/${jobId}/operations/list`;
+
+function parseISODateOnly(s) {
+  // Accept "YYYY-MM-DD" or any ISO; return millis or null
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+function addDaysMillis(ms, days) {
+  const d = new Date(ms);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.getTime();
+}
+function toUTCDateOnly(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
+}
+function toUTCTimestamp(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+}
+function pickOpTimes(op) {
+  const s = op?.scheduledStartUtc || op?.originalScheduledStartUtc || null;
+  const e = op?.scheduledEndUtc   || op?.originalScheduledEndUtc   || null;
+  return { start: s ? new Date(s).getTime() : null, end: e ? new Date(e).getTime() : null };
+}
+
+app.get("/calendar-ops.ics", async (req, res) => {
+  try {
+    if (ACCESS_KEY && req.query.key !== ACCESS_KEY) return res.sendStatus(403);
+
+    // Cache
+    const key = req.url;
+    const now = Date.now();
+    const hit = cache.get(key);
+    if (hit && now - hit.at < CACHE_TTL_SECONDS * 1000) {
+      const inm = req.headers["if-none-match"];
+      if (inm && inm === hit.etag) return res.status(304).end();
+      res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("ETag", hit.etag);
+      res.setHeader("Content-Disposition", 'inline; filename="bettis-ops.ics"');
+      return res.status(200).send(hit.body);
+    }
+
+    // ---- Query params ----
+    // Window: default [today-30d, today+120d] if not provided
+    const today = new Date();
+    const defStart = addDaysMillis(today.getTime(), -30);
+    const defEnd   = addDaysMillis(today.getTime(), +120);
+
+    const winStart = parseISODateOnly(req.query.s) ?? defStart;
+    const winEnd   = parseISODateOnly(req.query.u) ?? defEnd;
+
+    // allday=1 → all-day events; else precise times
+    const allDay = String(req.query.allday || "0") === "1";
+
+    // Operation statuses to include (default excludes 'complete')
+    const defaultOpStatuses = ["scheduled","inProgress","ready","pending","paused"];
+    const opStatuses = req.query.statuses
+      ? String(req.query.statuses).split(",").map(s => s.trim()).filter(Boolean)
+      : defaultOpStatuses;
+
+    const limit = parseInt(req.query.limit || "500", 10);
+
+    // ---- Server-side throttle via job created window ----
+    const bufferDays = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
+    const createdAfterUtc  = new Date(addDaysMillis(winStart, -bufferDays)).toISOString();
+    const createdBeforeUtc = new Date(addDaysMillis(winEnd,   +bufferDays)).toISOString();
+
+    const listBody = {
+      limit,
+      statuses: ["scheduled","inProgress","pending","ready","paused"], // job statuses to pull
+      createdAfterUtc,
+      createdBeforeUtc,
+    };
+
+    // 1) Jobs
+    const jobsResp = await postJson(JOBS_LIST, listBody);
+    const jobs = unwrapItems(jobsResp);
+
+    // 2) Ops per job
+    const rows = [];
+    for (const j of jobs) {
+      if (!j?.id) continue;
+      try {
+        const opsResp = await postJson(JOB_OPS_LIST(j.id), { limit: 500 });
+        const items = unwrapItems(opsResp);
+        for (const row of items) {
+          const op = row.operation || row;
+          const itm = row.itemToMake || {};
+          const { start, end } = pickOpTimes(op);
+
+          // Skip if no scheduling at all
+          if (!start && !end) continue;
+
+          // Window filter (overlap check)
+          const s = start ?? end;
+          const e = end ?? (start ? addDaysMillis(start, 0) : null);
+          if (s == null) continue;
+          const overlaps = (e ?? s) >= winStart && s <= winEnd;
+          if (!overlaps) continue;
+
+          // Status filter (operation-level)
+          const opStatus = String(op.status || "").trim();
+          if (opStatuses.length && !opStatuses.includes(opStatus)) continue;
+
+          // Build event fields
+          const title  = j.name || (j.number != null ? `Job #${j.number}` : "Operation");
+          const number = j.number != null ? `#${j.number}` : "";
+          const opName = op.name || "";
+          const equip  = op.scheduledEquipmentName || "";
+
+          const summary = [title, number, opName ? `(${opName})` : ""].filter(Boolean).join(" ");
+
+          const itemName =
+            itm?.itemReference?.name || itm?.itemReference?.number || "";
+          const descLines = [
+            opStatus ? `Status: ${opStatus}` : null,
+            equip    ? `Equipment: ${equip}` : null,
+            opName   ? `Operation: ${opName}` : null,
+            j.id     ? `Job ID: ${j.id}` : null,
+            itemName ? `Item: ${itemName}` : null,
+          ].filter(Boolean);
+
+          rows.push({
+            uid: crypto.createHash("sha1").update(`ops:${j.id}:${op.id}`).digest("hex") + "@bettis",
+            summary,
+            location: equip || "",
+            description: descLines.join("\\n"),
+            categories: [equip || null, opName || null, opStatus || null].filter(Boolean),
+            startMs: start ?? s,
+            endMs: end ?? (start ? addDaysMillis(start, 0) : s),
+          });
+        }
+      } catch {
+        // swallow per-job failures
+      }
+    }
+
+    // 3) Build ICS (all-day or timed)
+    const lines = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Bettis//Fulcrum Operations Schedule//EN",
+      "CALSCALE:GREGORIAN",
+      "METHOD:PUBLISH",
+      "X-WR-CALNAME:Fulcrum Ops",
+      "X-WR-TIMEZONE:UTC",
+    ];
+
+    for (const e of rows) {
+      if (allDay) {
+        // DTSTART/DTEND date-only; DTEND is exclusive → add 1 day
+        const startDate = new Date(e.startMs);
+        const endDateExclusive = new Date(addDaysMillis(e.endMs || e.startMs, 1));
+        lines.push(
+          "BEGIN:VEVENT",
+          `UID:${e.uid}`,
+          `DTSTAMP:${toUTCTimestamp(Date.now())}`,
+          `DTSTART;VALUE=DATE:${toUTCDateOnly(startDate)}`,
+          `DTEND;VALUE=DATE:${toUTCDateOnly(endDateExclusive)}`,
+          `SUMMARY:${icsEscape(e.summary)}`,
+          e.location ? `LOCATION:${icsEscape(e.location)}` : null,
+          e.description ? `DESCRIPTION:${icsEscape(e.description)}` : null,
+          e.categories?.length ? `CATEGORIES:${e.categories.map(icsEscape).join(",")}` : null,
+          "END:VEVENT"
+        );
+      } else {
+        lines.push(
+          "BEGIN:VEVENT",
+          `UID:${e.uid}`,
+          `DTSTAMP:${toUTCTimestamp(Date.now())}`,
+          `DTSTART:${toUTCTimestamp(e.startMs)}`,
+          `DTEND:${toUTCTimestamp(e.endMs || (e.startMs + 30*60*1000))}`,
+          `SUMMARY:${icsEscape(e.summary)}`,
+          e.location ? `LOCATION:${icsEscape(e.location)}` : null,
+          e.description ? `DESCRIPTION:${icsEscape(e.description)}` : null,
+          e.categories?.length ? `CATEGORIES:${e.categories.map(icsEscape).join(",")}` : null,
+          "END:VEVENT"
+        );
+      }
+    }
+
+    lines.push("END:VCALENDAR");
+    const ics = lines.filter(Boolean).join("\r\n");
+    const safe = finalizeIcs(ics);
+
+    const etag = 'W/"' + crypto.createHash("sha1").update(safe).digest("hex") + '"';
+    cache.set(key, { at: now, body: safe, etag });
+
+    res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("ETag", etag);
+    res.setHeader("Content-Disposition", 'inline; filename="bettis-ops.ics"');
+    res.status(200).send(safe);
+  } catch (err) {
+    res.status(500).send(`Error: ${err.message}`);
+  }
+});
+
+
+
 /* -------------------- test route -------------------- */
 app.get("/test.ics", (_req, res) => {
   const now = new Date();
