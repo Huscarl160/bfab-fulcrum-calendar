@@ -491,10 +491,71 @@ app.get("/calendar-ops.ics", async (req, res) => {
   }
 });
 
-/* -------------------- FEEDS index (plain text, no CSP issues) -------------------- */
+/* -------------------- FEEDS index  -------------------- */
 // Lists handy per-op URLs (rolling window, all-day). Copy-paste into Outlook.
+// Pretty feeds index (HTML)
+
+/* -------------------- feeds.css route -------------------- */
+app.get("/feeds.css", (req, res) => {
+  const css = `
+    body {
+      font-family: system-ui, sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+      padding: 2rem;
+      line-height: 1.6;
+    }
+    h1 {
+      color: #004c50;
+      text-align: center;
+      margin-bottom: 1.5rem;
+      font-size: 1.75rem;
+    }
+    .feed-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 1rem;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    a.feed {
+      display: block;
+      padding: 1.25rem;
+      background: white;
+      border-radius: 0.75rem;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      text-decoration: none;
+      color: #0f172a;
+      transition: all 0.15s ease-in-out;
+      border-left: 5px solid #004c50;
+    }
+    a.feed:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+      background: #f1f5f9;
+    }
+    .feed-title {
+      font-weight: 600;
+      font-size: 1.1rem;
+      margin-bottom: 0.25rem;
+    }
+    .feed-desc {
+      font-size: 0.9rem;
+      color: #475569;
+    }
+    footer {
+      text-align: center;
+      margin-top: 2rem;
+      font-size: 0.85rem;
+      color: #64748b;
+    }
+  `;
+  res.setHeader("Content-Type", "text/css; charset=utf-8");
+  res.status(200).send(css);
+});
+
+
 app.get("/feeds", (req, res) => {
-  // You can edit this list to match exactly your ops
   const ops = [
     "Saw",
     "Drill",
@@ -518,19 +579,91 @@ app.get("/feeds", (req, res) => {
   ];
 
   const base = `${req.protocol}://${req.get("host")}`;
+  const allOpsUrl = `${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending`;
+
+  const perOpLinks = ops.map(op => {
+    const url = `${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending&op=${encodeURIComponent(op)}`;
+    return `<a class="feed-btn" href="${url}">${op}</a>`;
+  }).join("");
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Fulcrum Ops Feeds</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/feeds.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <h1>Fulcrum Ops Feeds</h1>
+    </div>
+    <nav class="links">
+      <a href="/health" class="link">Health</a>
+      <a href="/test.ics" class="link">Test ICS</a>
+      <a href="/wake" class="link">Wake</a>
+    </nav>
+  </header>
+
+  <main class="wrap">
+    <section class="panel highlight">
+      <h2>All Operations</h2>
+      <p class="muted">Recommended feed showing Ready, In-Progress, Paused, and Pending operations as all-day events.</p>
+      <div class="btn-row">
+        <a class="feed-btn primary" href="${allOpsUrl}">Copy/Use All-Ops Feed</a>
+      </div>
+      <code class="url">${allOpsUrl}</code>
+    </section>
+
+    <section class="panel">
+      <h2>Per-Operation Feeds</h2>
+      <p class="muted">Add each to Outlook and assign category colors for instant visual sorting.</p>
+      <div class="grid">
+        ${perOpLinks}
+      </div>
+    </section>
+
+    <section class="panel tips">
+      <h3>Tips</h3>
+      <ul>
+        <li>If Outlook says “try again later,” open the link once in your browser to wake the service, then add again.</li>
+        <li>Events are all-day with exclusive DTEND (RFC5545-compliant), so multi-day ranges render correctly.</li>
+        <li>Want plain text? Use <a href="/feeds.txt">/feeds.txt</a>.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>© Bettis • Fulcrum Ops</span>
+  </footer>
+</body>
+</html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.status(200).send(html);
+});
+
+// Plain text variant (optional)
+app.get("/feeds.txt", (req, res) => {
+  const ops = [
+    "Saw","Drill","Plasma Cut","Laser Cut","OS Processing","Shear","Flex","Press Brake","Cobot Weld","Weld",
+    "Sand Blast / Clean","Paint","Repair","Trucking","Assemble","CAD / Engineering","Deburr / De-Slag","Packaging","Office / OH / Burden",
+  ];
+  const base = `${req.protocol}://${req.get("host")}`;
   const lines = [];
-  lines.push("Fulcrum Ops feeds (copy one URL per calendar into Outlook):");
+  lines.push("Fulcrum Ops feeds (copy URLs into Outlook):");
   lines.push("");
-  lines.push("# All ops (recommended statuses), all-day:");
+  lines.push("All Ops:");
   lines.push(`${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending`);
   lines.push("");
-  lines.push("# Per operation (useful for color-coding):");
+  lines.push("Per-Operation:");
   for (const op of ops) {
-    const url = `${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending&op=${encodeURIComponent(op)}`;
-    lines.push(`${op}: ${url}`);
+    lines.push(`${op}: ${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending&op=${encodeURIComponent(op)}`);
   }
   res.type("text/plain").send(lines.join("\n"));
 });
+
 
 /* -------------------- test -------------------- */
 app.get("/test.ics", (req, res) => {
