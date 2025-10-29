@@ -441,6 +441,42 @@ app.get("/calendar-ops.ics", async (req, res) => {
       .filter(s => OP_STATUS_WHITELIST.has(s) || OP_STATUS_WHITELIST.has(s.toLowerCase()))
       .map(s => (s === "inprogress" ? "inProgress" : s));
 
+      // parse optional filters
+      const opNames = (req.query.opNames || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(s => s.toLowerCase());
+
+      const equipFilter = (req.query.equip || "").trim().toLowerCase();
+
+      // ... after we get `arr` (all ops for the job), replace arrFiltered definition:
+
+      let arrFiltered = arr;
+
+      // filter by op status (existing)
+      if (opStatuses.length) {
+      arrFiltered = arrFiltered.filter(o =>
+        opStatuses.includes(String(o.status || ""))
+      );
+      }
+
+      // filter by operation names (case-insensitive, partial match OK)
+      if (opNames.length) {
+      arrFiltered = arrFiltered.filter(o => {
+        const name = String(o.name || "").toLowerCase();
+        return opNames.some(n => name.includes(n));
+      });
+      }
+
+      // filter by equipment code/name (case-insensitive contains)
+      if (equipFilter) {
+      arrFiltered = arrFiltered.filter(o => {
+        const eq = String(o.scheduledEquipmentName || "").toLowerCase();
+        return eq.includes(equipFilter);
+      });
+      }
+
     // ----- build jobs list body (created window expansion) -----
     const addDays = (dateLike, n) => {
       const x = new Date(dateLike);
