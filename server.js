@@ -383,30 +383,22 @@ app.get("/calendar-ops.ics", async (req, res) => {
     const jobs = unwrapItems(jobsResp);
 
     // fetch ops per job; client-filter by op status and op name
-    const opMap = new Map(); // jobId -> filtered ops[]
-    for (const job of jobs) {
-      try {
-        const resp = await postJson(`/api/jobs/${job.id}/operations/list`, { limit: 500 });
-        const opsAll = unwrapItems(resp).map((o) => o.operation || o);
+    // optional: client-side op-status + operation-name filtering
+    const onlyOp = req.query.only ? String(req.query.only).toLowerCase() : null;
 
-        // filter by op status (if any)
-        let opsFiltered = opStatuses.length
-          ? opsAll.filter((o) => {
-              const st = String(o.status || "");
-              return OP_STATUS_WHITELIST.has(st) && opStatuses.includes(st);
-            })
-          : opsAll;
+    const arrFiltered = arr.filter(o => {
+        const opStatus = String(o.status || "");
+        const allowedByStatus = opStatuses.length
+            ? (OP_STATUS_WHITELIST.has(opStatus) && opStatuses.includes(opStatus))
+            : true;
 
-        // filter by op name (if provided)
-        if (opNameFilter) {
-          opsFiltered = opsFiltered.filter((o) => String(o.name || "").trim() === opNameFilter);
-        }
+        const allowedByName = onlyOp
+            ? String(o.name || "").toLowerCase().includes(onlyOp)
+            : true;
 
-        opMap.set(job.id, opsFiltered);
-      } catch {
-        opMap.set(job.id, []);
-      }
-    }
+        return allowedByStatus && allowedByName;
+    });
+
 
     // build events (one VEVENT per primary op per job, same logic as before)
     const winStart = new Date(since).getTime();
@@ -494,6 +486,111 @@ app.get("/calendar-ops.ics", async (req, res) => {
 /* -------------------- FEEDS index  -------------------- */
 // Lists handy per-op URLs (rolling window, all-day). Copy-paste into Outlook.
 // Pretty feeds index (HTML)
+/* -------------------- feeds.css (dark theme) -------------------- */
+app.get("/feeds.css", (req, res) => {
+  const css = `
+    :root{
+      --bg:#0b1418;
+      --card:#101b20;
+      --ink:#d7e5e8;
+      --muted:#9fb2b6;
+      --brand:#00a2b1; /* Bettis teal-ish */
+      --brand-2:#05424a;
+      --ring:rgba(0,255,255,0.2);
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji;
+      background: radial-gradient(1200px 700px at 20% -10%, #0d1f24 0%, var(--bg) 50%), var(--bg);
+      color: var(--ink);
+      padding: 2rem;
+    }
+    .wrap{max-width:1000px;margin:0 auto}
+    h1{
+      font-weight:700;
+      font-size: clamp(1.2rem, 1rem + 1.2vw, 2rem);
+      text-align:center;
+      margin:0 0 1.25rem 0;
+      color:#e6fbff;
+      letter-spacing:.2px;
+    }
+    .desc{
+      text-align:center;
+      color:var(--muted);
+      margin:0 0 2rem 0;
+      font-size:.98rem;
+    }
+    .grid{
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+    .card{
+      background: linear-gradient(180deg, var(--card), #0e171b);
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 14px;
+      padding: 1rem;
+      box-shadow: 0 10px 24px rgba(0,0,0,0.25);
+    }
+    .op-title{
+      display:flex; align-items:center; gap:.6rem;
+      font-weight:600;
+      margin-bottom:.75rem;
+      letter-spacing:.2px;
+    }
+    .swatch{
+      width:12px;height:12px;border-radius:3px;flex:0 0 auto;box-shadow:0 0 0 2px #000 inset;
+    }
+    .url-row{
+      display:flex; gap:.5rem; align-items:center;
+      margin-top:.5rem; flex-wrap:wrap;
+    }
+    .url{
+      flex:1 1 auto;
+      background:#0b1214;
+      color:#bfe7ec;
+      border:1px solid #12343a;
+      border-radius:10px;
+      padding:.6rem .7rem;
+      font-size:.85rem;
+      overflow:auto;
+      white-space:nowrap;
+    }
+    .btns{display:flex; gap:.5rem; margin-top:.7rem; flex-wrap:wrap;}
+    .btn{
+      appearance:none; border:0; cursor:pointer;
+      background: linear-gradient(180deg, var(--brand), var(--brand-2));
+      color:#eaffff; padding:.6rem .8rem; border-radius:10px;
+      font-weight:600; font-size:.9rem; letter-spacing:.2px;
+      transition: transform .08s ease, box-shadow .08s ease;
+      box-shadow: 0 6px 16px rgba(0, 255, 255, .12);
+    }
+    .btn:hover{ transform: translateY(-1px); box-shadow: 0 10px 24px rgba(0, 255, 255, .15);}
+    .btn.secondary{
+      background: linear-gradient(180deg, #1b2c31, #172327);
+      color:#c7e6ea;
+      border:1px solid #12343a;
+      box-shadow:none;
+    }
+    .foot{
+      text-align:center;
+      color:var(--muted);
+      margin-top:2rem;
+      font-size:.85rem;
+    }
+    .tiny{color:#7aa1a7; font-size:.85rem}
+    .ok{color:#9cffd7}
+    .err{color:#ff9c9c}
+    .pill{
+      display:inline-block; padding:.15rem .45rem; border-radius:999px;
+      border:1px solid #1b3236; background:#0e171b; color:#a4cad0; font-size:.75rem; margin-left:.35rem;
+    }
+  `;
+  res.setHeader("Content-Type", "text/css; charset=utf-8");
+  res.status(200).send(css);
+});
 
 /* -------------------- feeds.css route -------------------- */
 app.get("/feeds.css", (req, res) => {
@@ -555,113 +652,114 @@ app.get("/feeds.css", (req, res) => {
 });
 
 
+/* -------------------- pretty feeds directory -------------------- */
 app.get("/feeds", (req, res) => {
-  const ops = [
-    "Saw",
-    "Drill",
-    "Plasma Cut",
-    "Laser Cut",
-    "OS Processing",
-    "Shear",
-    "Flex",
-    "Press Brake",
-    "Cobot Weld",
-    "Weld",
-    "Sand Blast / Clean",
-    "Paint",
-    "Repair",
-    "Trucking",
-    "Assemble",
-    "CAD / Engineering",
-    "Deburr / De-Slag",
-    "Packaging",
-    "Office / OH / Burden",
+  // Base URL for this service (works behind Render proxies)
+  const base = `${req.protocol}://${req.get("host")}`;
+
+  // Rolling window: past 30 days → next 120 days (change as desired)
+  const now = new Date();
+  const past = new Date(now); past.setUTCDate(past.getUTCDate() - 30);
+  const next = new Date(now); next.setUTCDate(next.getUTCDate() + 120);
+  const toISODate = d => d.toISOString().slice(0,10);
+
+  // Common params: we include op statuses that are useful on the floor
+  const commonQS = (opName) =>
+    `statuses=scheduled,inProgress,ready,pending,paused&ops=1&s=${toISODate(past)}&u=${toISODate(next)}&only=${encodeURIComponent(opName)}`;
+
+  // Suggested color per operation (feel free to tweak)
+  const OPS = [
+    { name: "Saw",                  color: "#0ea5e9" },
+    { name: "Drill",                color: "#f59e0b" },
+    { name: "Laser Cut",            color: "#22c55e" },
+    { name: "Press Brake",          color: "#a78bfa" },
+    { name: "Shear",                color: "#84cc16" },
+    { name: "Flex",                 color: "#eab308" },
+    { name: "Weld",                 color: "#ef4444" },
+    { name: "Cobot Weld",           color: "#fb7185" },
+    { name: "Sand Blast / Clean",   color: "#8b5cf6" },
+    { name: "Paint",                color: "#f97316" },
+    { name: "Packaging",            color: "#14b8a6" },
+    { name: "CAD / Engineering",    color: "#38bdf8" },
+    { name: "Office / OH / Burden", color: "#64748b" },
+    { name: "OS Processing",        color: "#f472b6" },
+    { name: "Trucking",             color: "#10b981" }
   ];
 
-  const base = `${req.protocol}://${req.get("host")}`;
-  const allOpsUrl = `${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending`;
+  // Build rows
+  const rows = OPS.map(op => {
+    const url = `${base}/calendar-ops.ics?${commonQS(op.name)}`;
+    const safeUrl = url.replace(/&/g, "&amp;").replace(/</g, "&lt;"); // minimal escape
+    return `
+      <div class="card">
+        <div class="op-title">
+          <span class="swatch" style="background:${op.color}"></span>
+          <span>${op.name}</span>
+          <span class="pill">Outlook color: ${op.color}</span>
+        </div>
+        <div class="url-row">
+          <div class="url" id="u-${encodeURIComponent(op.name)}">${safeUrl}</div>
+        </div>
+        <div class="btns">
+          <button class="btn" onclick="openFeed('${safeUrl}')">Open feed</button>
+          <button class="btn secondary" onclick="copyURL('u-${encodeURIComponent(op.name)}')">Copy URL</button>
+        </div>
+      </div>
+    `;
+  }).join("\n");
 
-  const perOpLinks = ops.map(op => {
-    const url = `${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending&op=${encodeURIComponent(op)}`;
-    return `<a class="feed-btn" href="${url}">${op}</a>`;
-  }).join("");
-
-  const html = `<!doctype html>
+  const html = `
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Fulcrum Ops Feeds</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="/feeds.css">
-</head>
-<body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="dot"></span>
-      <h1>Fulcrum Ops Feeds</h1>
-    </div>
-    <nav class="links">
-      <a href="/health" class="link">Health</a>
-      <a href="/test.ics" class="link">Test ICS</a>
-      <a href="/wake" class="link">Wake</a>
-    </nav>
-  </header>
-
-  <main class="wrap">
-    <section class="panel highlight">
-      <h2>All Operations</h2>
-      <p class="muted">Recommended feed showing Ready, In-Progress, Paused, and Pending operations as all-day events.</p>
-      <div class="btn-row">
-        <a class="feed-btn primary" href="${allOpsUrl}">Copy/Use All-Ops Feed</a>
-      </div>
-      <code class="url">${allOpsUrl}</code>
-    </section>
-
-    <section class="panel">
-      <h2>Per-Operation Feeds</h2>
-      <p class="muted">Add each to Outlook and assign category colors for instant visual sorting.</p>
+  <head>
+    <meta charset="utf-8"/>
+    <title>Bettis Fulcrum Operation Feeds</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <link rel="stylesheet" href="/feeds.css">
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Bettis Fulcrum – Operation Calendars</h1>
+      <p class="desc">
+        Each tile is a dedicated iCalendar feed for that operation. Add multiple feeds to Outlook
+        and assign a matching color (<span class="tiny">the suggested hex is shown on each</span>).
+        <br/>Window: <span class="ok">past 30 days → next 120 days</span>. All URLs stay fresh automatically.
+      </p>
       <div class="grid">
-        ${perOpLinks}
+        ${rows}
       </div>
-    </section>
+      <footer class="foot">
+        Tip: For SharePoint/Teams calendars, use “Add calendar from internet” with these URLs.
+      </footer>
+    </div>
 
-    <section class="panel tips">
-      <h3>Tips</h3>
-      <ul>
-        <li>If Outlook says “try again later,” open the link once in your browser to wake the service, then add again.</li>
-        <li>Events are all-day with exclusive DTEND (RFC5545-compliant), so multi-day ranges render correctly.</li>
-        <li>Want plain text? Use <a href="/feeds.txt">/feeds.txt</a>.</li>
-      </ul>
-    </section>
-  </main>
-
-  <footer class="foot">
-    <span>© Bettis • Fulcrum Ops</span>
-  </footer>
-</body>
+    <script>
+      async function copyURL(id){
+        try{
+          const el = document.getElementById(id);
+          const text = el?.textContent?.trim() || "";
+          if(!text) return;
+          await navigator.clipboard.writeText(text);
+          flash(el, "Copied!");
+        }catch(e){
+          alert("Copy failed. You can select and copy manually.");
+        }
+      }
+      function flash(el, msg){
+        const old = el.textContent;
+        el.textContent = msg;
+        el.style.outline = "2px solid var(--ring)";
+        setTimeout(()=>{ el.textContent = old; el.style.outline="none"; }, 900);
+      }
+      function openFeed(url){
+        // Opening the .ics directly prompts download in most browsers; Outlook can subscribe via URL
+        window.open(url, "_blank", "noopener,noreferrer");
+      }
+    </script>
+  </body>
 </html>`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.status(200).send(html);
-});
-
-// Plain text variant (optional)
-app.get("/feeds.txt", (req, res) => {
-  const ops = [
-    "Saw","Drill","Plasma Cut","Laser Cut","OS Processing","Shear","Flex","Press Brake","Cobot Weld","Weld",
-    "Sand Blast / Clean","Paint","Repair","Trucking","Assemble","CAD / Engineering","Deburr / De-Slag","Packaging","Office / OH / Burden",
-  ];
-  const base = `${req.protocol}://${req.get("host")}`;
-  const lines = [];
-  lines.push("Fulcrum Ops feeds (copy URLs into Outlook):");
-  lines.push("");
-  lines.push("All Ops:");
-  lines.push(`${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending`);
-  lines.push("");
-  lines.push("Per-Operation:");
-  for (const op of ops) {
-    lines.push(`${op}: ${base}/calendar-ops.ics?allday=1&statuses=ready,inProgress,paused,pending&op=${encodeURIComponent(op)}`);
-  }
-  res.type("text/plain").send(lines.join("\n"));
 });
 
 
