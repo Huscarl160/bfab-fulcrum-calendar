@@ -52,7 +52,6 @@ function vevent({ uid, start, end, summary, location, description, categories, a
   const lines = ["BEGIN:VEVENT", `UID:${uid}`, `DTSTAMP:${toUTC(Date.now())}`];
 
   if (allday) {
-    // DTSTART/DTEND as DATE (DTEND exclusive per RFC5545)
     const ds = toUTCDateOnly(new Date(start));
     const de = toUTCDateOnly(new Date(end));
     lines.push(`DTSTART;VALUE=DATE:${ds}`);
@@ -66,9 +65,16 @@ function vevent({ uid, start, end, summary, location, description, categories, a
   if (location) lines.push(`LOCATION:${icsEscape(location)}`);
   if (description) lines.push(`DESCRIPTION:${icsEscape(description)}`);
   if (categories && categories.length) lines.push(`CATEGORIES:${categories.map(icsEscape).join(",")}`);
+
+  // Play nice with Outlook and others
+  lines.push(`TRANSP:OPAQUE`);
+  lines.push(`X-MICROSOFT-CDO-BUSYSTATUS:BUSY`);
+  lines.push(`CLASS:PUBLIC`);
+
   lines.push("END:VEVENT");
   return lines.join("\r\n");
 }
+
 
 async function postJson(path, body) {
   const res = await fetch(`${BASE}${path}`, {
@@ -363,6 +369,64 @@ app.get("/calendar.ics", async (req, res) => {
   }
 });
 
+
+/* -------------------- Change to calendar-ops.ics field mapping -------------------- */
+function mapOpToEvent(job, op) {
+  const start =
+    op?.scheduledStartUtc ||
+    op?.originalScheduledStartUtc ||
+    null;
+
+  let end =
+    op?.scheduledEndUtc ||
+    op?.originalScheduledEndUtc ||
+    start;
+
+  if (!start) return null;
+
+  const jobNum = job.number != null ? `#${job.number}` : "";
+  const jobTitle = job.name || "Untitled Job";
+  const opName = op?.name || "Operation";
+  const equip = op?.scheduledEquipmentName || "";
+
+  const summary = [opName, "—", jobNum ? `${jobNum}:` : "", jobTitle]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " "); // tidy spacing
+
+  // Build a human-friendly date span in UTC for the description
+  const fmt = (iso) => {
+    const d = new Date(iso);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
+  };
+
+  const lines = [
+    `Job: ${[jobNum, jobTitle].filter(Boolean).join(" — ")}`,
+    `Operation: ${opName}`,
+    job.status ? `Status: ${job.status}` : null,
+    equip ? `Equipment: ${equip}` : null,
+    start ? `Dates: ${fmt(start)} → ${fmt(end || start)}` : null,
+    job.salesOrderId ? `Sales Order: ${job.salesOrderId}` : null,
+    `Job ID: ${job.id || "n/a"}${op?.id ? `  |  Op ID: ${op.id}` : ""}`,
+  ].filter(Boolean);
+
+  const categories = [opName, op?.status || "", equip].filter(Boolean);
+
+  return {
+    id: job.id,
+    opId: op?.id || null,
+    start,
+    end,
+    summary,
+    location: equip || "",
+    description: lines.join("\\n"),
+    categories,
+  };
+}
+
+
+
 /* -------------------- OPS-DRIVEN ICS (per-op friendly) -------------------- */
 // /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Laser%20Cut&statuses=ready,inProgress,paused,pending
 app.get("/calendar-ops.ics", async (req, res) => {
@@ -408,74 +472,49 @@ app.get("/calendar-ops.ics", async (req, res) => {
 
     // Fetch ops per job, then filter to matching ops.
     // If onlyOp is present, we require at least one matching op or we skip the job entirely.
-    const winStart = new Date(since).getTime();
-    const winEnd = new Date(until).getTime();
-    const events = [];
+    // build events (ONE VEVENT PER MATCHING OP)
+const winStart = new Date(since).getTime();
+const winEnd = new Date(until).getTime();
+const events = [];
 
-    for (const job of jobs) {
-      let ops = [];
-      try {
-        const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 500 });
-        ops = unwrapItems(opsResp).map((o) => o.operation || o);
-      } catch {
-        ops = [];
-      }
+for (const job of jobs) {
+  const ops = opMap.get(job.id) || [];
 
-      // Filter ops by status and name
-      const filtered = ops.filter((o) => {
-        const opStatus = String(o.status || "");
-        const allowedByStatus = opStatuses.length ? opStatuses.includes(opStatus) : true;
-        const allowedByName = onlyOp ? String(o.name || "").toLowerCase().includes(onlyOp) : true;
-        return allowedByStatus && allowedByName;
-      });
+  for (const op of ops) {
+    // Require operation-level times for per-op feeds
+    const startIso = op?.scheduledStartUtc || op?.originalScheduledStartUtc || null;
+    let endIso = op?.scheduledEndUtc || op?.originalScheduledEndUtc || startIso;
+    if (!startIso) continue;
 
-      // If an op-name filter is set, skip jobs with no matching ops
-      if (onlyOp && filtered.length === 0) continue;
+    // window clip on op times
+    const sMs = new Date(startIso).getTime();
+    const eMs = new Date(endIso).getTime() || sMs;
+    if (eMs < winStart) continue;
+    if (sMs > winEnd) continue;
 
-      // If no op-name filter, you *could* fall back to a single primary op per job.
-      // But since this is calendar-ops, we’ll still emit per-op events for any ops that passed status filters.
-      const opsToEmit = filtered.length ? filtered : [];
+    // map event with our new field layout
+    const ev = mapOpToEvent(job, op);
+    if (!ev) continue;
 
-      for (const op of opsToEmit) {
-        // Prefer operation times; if missing, skip (don’t fall back to job times for per-op feeds)
-        const startIso =
-          op?.scheduledStartUtc ||
-          op?.originalScheduledStartUtc ||
-          null;
-
-        let endIso =
-          op?.scheduledEndUtc ||
-          op?.originalScheduledEndUtc ||
-          startIso;
-
-        if (!startIso) continue;
-
-        // Window clip against op times
-        const sMs = new Date(startIso).getTime();
-        const eMs = new Date(endIso).getTime() || sMs;
-        if (eMs < winStart) continue;
-        if (sMs > winEnd) continue;
-
-        // All-day coercion (exclusive DTEND)
-        let finalStart = startIso;
-        let finalEnd = endIso;
-        if (wantAllDay) {
-          const sDate = new Date(Date.UTC(new Date(sMs).getUTCFullYear(), new Date(sMs).getUTCMonth(), new Date(sMs).getUTCDate()));
-          const eDate = new Date(Date.UTC(new Date(eMs).getUTCFullYear(), new Date(eMs).getUTCMonth(), new Date(eMs).getUTCDate() + 1));
-          finalStart = sDate.toISOString();
-          finalEnd = eDate.toISOString();
-        }
-
-        // Build event using the operation as the “primary”
-        const ev = mapJobToEvent(job, op, null);
-        ev.start = finalStart;
-        ev.end = finalEnd;
-
-        // Stronger summary emphasis on op name
-        // (mapJobToEvent already includes (opName) — keep that)
-        events.push(ev);
-      }
+    // allday support (exclusive DTEND)
+    if (wantAllDay) {
+      const sDate = new Date(Date.UTC(new Date(sMs).getUTCFullYear(), new Date(sMs).getUTCMonth(), new Date(sMs).getUTCDate()));
+      const eDate = new Date(Date.UTC(new Date(eMs).getUTCFullYear(), new Date(eMs).getUTCMonth(), new Date(eMs).getUTCDate() + 1));
+      ev.start = sDate.toISOString();
+      ev.end = eDate.toISOString();
     }
+
+    // UID includes op id when available so Outlook doesn't dedupe different ops
+    ev.uid =
+      crypto
+        .createHash("sha1")
+        .update(`fulcrum:${ev.id}:${ev.opId || "nop"}:${ev.start}`)
+        .digest("hex") + "@bettis";
+
+    events.push(ev);
+  }
+}
+
 
     const ics =
       [
