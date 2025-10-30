@@ -424,8 +424,27 @@ function mapOpToEvent(job, op) {
   };
 }
 
-/* -------------------- OPS-DRIVEN ICS (per-op friendly) -------------------- */
-// /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Laser%20Cut&statuses=ready,inProgress,paused,pending
+// --- helpers for aggregation ---
+function humanUTC(iso) {
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
+         `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
+}
+
+function opLine(job, op, startIso, endIso) {
+  const itemName =
+    op?.itemReference?.name ||
+    op?.itemReference?.number ||
+    op?.description || // if Fulcrum sticks item text here
+    `Op ${op?.id || ""}`.trim();
+
+  const equip = op?.scheduledEquipmentName ? ` | Equip: ${op.scheduledEquipmentName}` : "";
+  const when = `${humanUTC(startIso)} → ${humanUTC(endIso)}`;
+  return `- ${itemName} | ${when}${equip}`;
+}
+
+// /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Saw&statuses=ready,inProgress,paused,pending
 app.get("/calendar-ops.ics", async (req, res) => {
   try {
     if (ACCESS_KEY && req.query.key !== ACCESS_KEY) return res.sendStatus(403);
@@ -453,9 +472,8 @@ app.get("/calendar-ops.ics", async (req, res) => {
       ? String(req.query.statuses).split(",").map((s) => s.trim()).filter(Boolean)
       : [];
     const jobStatuses = rawStatuses.filter((s) => JOB_STATUS_WHITELIST.has(s));
-    const opStatuses = rawStatuses.filter((s) => OP_STATUS_WHITELIST.has(s));
+    const opStatuses  = rawStatuses.filter((s) => OP_STATUS_WHITELIST.has(s));
 
-    // Required for per-op feeds: the operation name filter (case-insensitive substring match)
     const onlyOp = req.query.only ? String(req.query.only).toLowerCase() : null;
 
     // Build job list using a created window that pads the schedule window
@@ -467,8 +485,8 @@ app.get("/calendar-ops.ics", async (req, res) => {
     const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
-    // Fetch ops per job and filter by status/name into opMap
-    const opMap = new Map(); // jobId -> filtered ops[]
+    // Fetch & filter ops per job
+    const opMap = new Map(); // jobId -> ops[]
     for (const job of jobs) {
       try {
         const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 500 });
@@ -476,8 +494,10 @@ app.get("/calendar-ops.ics", async (req, res) => {
         const filtered = ops.filter((o) => {
           const opStatus = String(o.status || "");
           const allowedByStatus = opStatuses.length ? opStatuses.includes(opStatus) : true;
-          const allowedByName = onlyOp ? String(o.name || "").toLowerCase().includes(onlyOp) : true;
-          return allowedByStatus && allowedByName;
+          const allowedByName   = onlyOp ? String(o.name || "").toLowerCase().includes(onlyOp) : true;
+          // must have sched/original start to be calendar-relevant
+          const hasTime = !!(o?.scheduledStartUtc || o?.originalScheduledStartUtc);
+          return allowedByStatus && allowedByName && hasTime;
         });
         opMap.set(job.id, filtered);
       } catch {
@@ -485,50 +505,100 @@ app.get("/calendar-ops.ics", async (req, res) => {
       }
     }
 
-    // build events (ONE VEVENT PER MATCHING OP)
+    // Aggregate: bucket by jobId + opName (case-insensitive)
     const winStart = new Date(since).getTime();
-    const winEnd = new Date(until).getTime();
-    const events = [];
+    const winEnd   = new Date(until).getTime();
+    const buckets = new Map(); // key -> { job, opName, ops: [{op, startIso, endIso}] }
 
     for (const job of jobs) {
       const ops = opMap.get(job.id) || [];
-
-      // If an op-name filter is set, skip jobs with no matching ops
       if (onlyOp && ops.length === 0) continue;
 
       for (const op of ops) {
-        // Require operation-level times for per-op feeds
         const startIso = op?.scheduledStartUtc || op?.originalScheduledStartUtc || null;
-        let endIso = op?.scheduledEndUtc || op?.originalScheduledEndUtc || startIso;
+        let   endIso   = op?.scheduledEndUtc   || op?.originalScheduledEndUtc   || startIso;
         if (!startIso) continue;
 
-        // window clip on op times
         const sMs = new Date(startIso).getTime();
         const eMs = new Date(endIso).getTime() || sMs;
         if (eMs < winStart) continue;
-        if (sMs > winEnd) continue;
+        if (sMs > winEnd)   continue;
 
-        // map event with our new field layout
-        const ev = mapOpToEvent(job, op);
-        if (!ev) continue;
+        const opName = (op?.name || "Operation").trim();
+        const key2 = `${job.id}::${opName.toLowerCase()}`; // bucket key
 
-        // allday support (exclusive DTEND)
-        if (wantAllDay) {
-          const sDate = new Date(Date.UTC(new Date(sMs).getUTCFullYear(), new Date(sMs).getUTCMonth(), new Date(sMs).getUTCDate()));
-          const eDate = new Date(Date.UTC(new Date(eMs).getUTCFullYear(), new Date(eMs).getUTCMonth(), new Date(eMs).getUTCDate() + 1));
-          ev.start = sDate.toISOString();
-          ev.end = eDate.toISOString();
+        if (!buckets.has(key2)) {
+          buckets.set(key2, { job, opName, ops: [] });
         }
-
-        // UID includes op id when available so Outlook doesn't dedupe different ops
-        const computedUid =
-          crypto
-            .createHash("sha1")
-            .update(`fulcrum:${ev.id}:${ev.opId || "nop"}:${ev.start}`)
-            .digest("hex") + "@bettis";
-
-        events.push({ ...ev, uid: computedUid });
+        buckets.get(key2).ops.push({ op, startIso, endIso });
       }
+    }
+
+    // Build one event per bucket
+    const events = [];
+    for (const [, bucket] of buckets) {
+      const { job, opName, ops } = bucket;
+      if (!ops.length) continue;
+
+      // Earliest start, latest end across all ops in this bucket
+      const sMs = Math.min(...ops.map(x => new Date(x.startIso).getTime()));
+      const eMs = Math.max(...ops.map(x => new Date(x.endIso).getTime() || new Date(x.startIso).getTime()));
+
+      let startIso = new Date(sMs).toISOString();
+      let endIso   = new Date(eMs).toISOString();
+
+      // allday support (exclusive DTEND)
+      if (wantAllDay) {
+        const sDate = new Date(Date.UTC(new Date(sMs).getUTCFullYear(), new Date(sMs).getUTCMonth(), new Date(sMs).getUTCDate()));
+        const eDate = new Date(Date.UTC(new Date(eMs).getUTCFullYear(), new Date(eMs).getUTCMonth(), new Date(eMs).getUTCDate() + 1));
+        startIso = sDate.toISOString();
+        endIso   = eDate.toISOString();
+      }
+
+      // Unique equipments across ops
+      const equipments = Array.from(new Set(ops.map(x => x.op?.scheduledEquipmentName).filter(Boolean)));
+      const location   = equipments.length === 1 ? equipments[0] : (equipments.length > 1 ? "Multiple" : "");
+
+      const jobNum   = job.number != null ? `#${job.number}` : "";
+      const jobTitle = job.name || "Untitled Job";
+      const itemCount = ops.length;
+
+      const summary = [
+        opName, "—", jobNum ? `${jobNum}:` : "", jobTitle, itemCount > 1 ? `(${itemCount} items)` : ""
+      ].filter(Boolean).join(" ").replace(/\s+/g, " ");
+
+      const headerLines = [
+        `Job: ${[jobNum, jobTitle].filter(Boolean).join(" — ")}`,
+        `Operation: ${opName}`,
+        job.status ? `Status: ${job.status}` : null,
+        equipments.length ? `Equipment: ${equipments.join(", ")}` : null,
+        `Span: ${humanUTC(startIso)} → ${humanUTC(endIso)}`
+      ].filter(Boolean);
+
+      const itemLines = ops
+        .sort((a,b) => new Date(a.startIso) - new Date(b.startIso))
+        .map(x => opLine(job, x.op, x.startIso, x.endIso));
+
+      const description = [...headerLines, "", "Items:", ...itemLines].join("\\n");
+
+      const categories = [opName, job.status || "", ...(equipments.slice(0, 3))].filter(Boolean);
+
+      // UID stable per (jobId + opName + span)
+      const uid = crypto
+        .createHash("sha1")
+        .update(`fulcrum:agg:${job.id}:${opName.toLowerCase()}:${startIso}:${endIso}`)
+        .digest("hex") + "@bettis";
+
+      events.push({
+        id: job.id,
+        start: startIso,
+        end: endIso,
+        summary,
+        location,
+        description,
+        categories,
+        uid
+      });
     }
 
     const ics =
@@ -538,13 +608,11 @@ app.get("/calendar-ops.ics", async (req, res) => {
         "PRODID:-//Bettis//Fulcrum Ops Schedule//EN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-WR-CALNAME:Fulcrum Ops",
+        "X-WR-CALNAME:Fulcrum Ops (Aggregated)",
         "X-WR-TIMEZONE:UTC",
         ...events.map((e) =>
           vevent({
-            uid:
-              e.uid ||
-              (crypto.createHash("sha1").update(`fulcrum:${e.id}:${e.start}:${e.summary}`).digest("hex") + "@bettis"),
+            uid: e.uid,
             start: e.start,
             end: e.end,
             summary: e.summary,
@@ -570,6 +638,7 @@ app.get("/calendar-ops.ics", async (req, res) => {
     res.status(500).send(`Error: ${err.message}`);
   }
 });
+
 
 async function getDiscoveredOps() {
   const now = Date.now();
