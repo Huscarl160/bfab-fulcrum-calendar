@@ -652,114 +652,187 @@ app.get("/feeds.css", (req, res) => {
 });
 
 
-/* -------------------- pretty feeds directory -------------------- */
-app.get("/feeds", (req, res) => {
-  // Base URL for this service (works behind Render proxies)
-  const base = `${req.protocol}://${req.get("host")}`;
+// ---------- Pretty feeds page (dark, buttons, copy/open) ----------
+app.get("/feeds", async (req, res) => {
+  try {
+    // small discovery sweep
+    const jobsResp = await postJson(JOBS_LIST, { limit: 150 });
+    const jobs = unwrapItems(jobsResp);
 
-  // Rolling window: past 30 days → next 120 days (change as desired)
-  const now = new Date();
-  const past = new Date(now); past.setUTCDate(past.getUTCDate() - 30);
-  const next = new Date(now); next.setUTCDate(next.getUTCDate() + 120);
-  const toISODate = d => d.toISOString().slice(0,10);
+    const opNames = new Set();
+    for (const j of jobs) {
+      try {
+        const opsResp = await postJson(JOB_OPS_LIST(j.id), { limit: 200 });
+        const ops = unwrapItems(opsResp).map(o => o.operation || o);
+        for (const o of ops) if (o?.name) opNames.add(o.name);
+      } catch {
+        /* ignore per-job errors */
+      }
+      if (opNames.size >= 50) break; // don't overfetch
+    }
 
-  // Common params: we include op statuses that are useful on the floor
-  const commonQS = (opName) =>
-    `statuses=scheduled,inProgress,ready,pending,paused&ops=1&s=${toISODate(past)}&u=${toISODate(next)}&only=${encodeURIComponent(opName)}`;
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
 
-  // Suggested color per operation (feel free to tweak)
-  const OPS = [
-    { name: "Saw",                  color: "#0ea5e9" },
-    { name: "Drill",                color: "#f59e0b" },
-    { name: "Laser Cut",            color: "#22c55e" },
-    { name: "Press Brake",          color: "#a78bfa" },
-    { name: "Shear",                color: "#84cc16" },
-    { name: "Flex",                 color: "#eab308" },
-    { name: "Weld",                 color: "#ef4444" },
-    { name: "Cobot Weld",           color: "#fb7185" },
-    { name: "Sand Blast / Clean",   color: "#8b5cf6" },
-    { name: "Paint",                color: "#f97316" },
-    { name: "Packaging",            color: "#14b8a6" },
-    { name: "CAD / Engineering",    color: "#38bdf8" },
-    { name: "Office / OH / Burden", color: "#64748b" },
-    { name: "OS Processing",        color: "#f472b6" },
-    { name: "Trucking",             color: "#10b981" }
-  ];
+    // rolling window: past 14 days to next 60 days
+    const today = new Date();
+    const isoDate = (d) => d.toISOString().slice(0, 10);
+    const start = new Date(today); start.setUTCDate(start.getUTCDate() - 14);
+    const end   = new Date(today); end.setUTCDate(end.getUTCDate() + 60);
+    const s = isoDate(start);
+    const u = isoDate(end);
 
-  // Build rows
-  const rows = OPS.map(op => {
-    const url = `${base}/calendar-ops.ics?${commonQS(op.name)}`;
-    const safeUrl = url.replace(/&/g, "&amp;").replace(/</g, "&lt;"); // minimal escape
-    return `
-      <div class="card">
-        <div class="op-title">
-          <span class="swatch" style="background:${op.color}"></span>
-          <span>${op.name}</span>
-          <span class="pill">Outlook color: ${op.color}</span>
-        </div>
-        <div class="url-row">
-          <div class="url" id="u-${encodeURIComponent(op.name)}">${safeUrl}</div>
-        </div>
-        <div class="btns">
-          <button class="btn" onclick="openFeed('${safeUrl}')">Open feed</button>
-          <button class="btn secondary" onclick="copyURL('u-${encodeURIComponent(op.name)}')">Copy URL</button>
-        </div>
-      </div>
-    `;
-  }).join("\n");
+    // friendly color suggestions (fallback gray if unknown)
+    const colorMap = {
+      "Laser Cut": "#f59e0b",
+      "Press Brake": "#3b82f6",
+      "Saw": "#10b981",
+      "Drill": "#ef4444",
+      "Shear": "#a855f7",
+      "Weld": "#f97316",
+      "Cobot Weld": "#14b8a6",
+      "Sand Blast / Clean": "#eab308",
+      "Paint": "#22c55e",
+      "Packaging": "#06b6d4",
+      "Flex": "#8b5cf6",
+      "OS Processing": "#64748b",
+      "CAD / Engineering": "#60a5fa",
+      "Trucking": "#84cc16",
+      "Office / OH / Burden": "#94a3b8"
+    };
 
-  const html = `
-<!doctype html>
+    const defaultStatuses = "scheduled,inProgress,ready,pending,paused";
+    const feeds = Array.from(opNames).sort().map(name => {
+      const only = encodeURIComponent(name);
+      const url =
+        `${baseUrl}/calendar-ops.ics?only=${only}` +
+        `&s=${s}&u=${u}&allday=1&limit=500&statuses=${encodeURIComponent(defaultStatuses)}`;
+      return {
+        name,
+        url,
+        color: colorMap[name] || "#6b7280"
+      };
+    });
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8"/>
-    <title>Bettis Fulcrum Operation Feeds</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1"/>
-    <link rel="stylesheet" href="/feeds.css">
-  </head>
-  <body>
-    <div class="wrap">
-      <h1>Bettis Fulcrum – Operation Calendars</h1>
-      <p class="desc">
-        Each tile is a dedicated iCalendar feed for that operation. Add multiple feeds to Outlook
-        and assign a matching color (<span class="tiny">the suggested hex is shown on each</span>).
-        <br/>Window: <span class="ok">past 30 days → next 120 days</span>. All URLs stay fresh automatically.
-      </p>
-      <div class="grid">
-        ${rows}
-      </div>
-      <footer class="foot">
-        Tip: For SharePoint/Teams calendars, use “Add calendar from internet” with these URLs.
-      </footer>
-    </div>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Fulcrum Operation Feeds</title>
+<style>
+  :root{
+    --bg:#0b1220; --panel:#111827; --muted:#9ca3af; --fg:#e5e7eb; --accent:#38bdf8; --card:#0f172a; --chip:#1f2937;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  header{max-width:1100px;margin:32px auto 0;padding:0 16px}
+  h1{margin:0 0 4px 0;font-size:28px;font-weight:700}
+  p.sub{margin:0;color:var(--muted)}
+  .panel{max-width:1100px;margin:24px auto;padding:16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+  .card{background:var(--card);border:1px solid #1f2937;border-radius:14px;padding:14px;box-shadow:0 10px 18px rgba(0,0,0,.25)}
+  .name{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  .swatch{width:14px;height:14px;border-radius:3px;border:1px solid rgba(255,255,255,.25);flex:0 0 auto}
+  .url{font-size:12px;color:var(--muted);word-break:break-all;margin:8px 0 12px}
+  .btnrow{display:flex;gap:8px}
+  button{appearance:none;border:1px solid #334155;background:#0b1220;color:var(--fg);padding:8px 10px;border-radius:10px;cursor:pointer}
+  button.primary{background:var(--accent);color:#001018;border:none}
+  button:active{transform:translateY(1px)}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
+  .chip{background:var(--chip);color:var(--muted);border-radius:999px;padding:4px 10px;font-size:12px;border:1px solid #374151}
+  footer{max-width:1100px;margin:18px auto 40px;color:var(--muted);font-size:12px;padding:0 16px}
+</style>
+</head>
+<body>
+  <header>
+    <h1>Fulcrum Operation Feeds</h1>
+    <p class="sub">Copy or open an ICS feed for a specific operation. These links use a rolling window (past 14 days → next 60).</p>
+  </header>
+  <section class="panel">
+    <div id="grid" class="grid"></div>
+  </section>
+  <footer>
+    Tip: Add multiple feeds to Outlook and color-code each one. Rolling dates prevent feeds from going stale.
+  </footer>
 
-    <script>
-      async function copyURL(id){
-        try{
-          const el = document.getElementById(id);
-          const text = el?.textContent?.trim() || "";
-          if(!text) return;
-          await navigator.clipboard.writeText(text);
-          flash(el, "Copied!");
-        }catch(e){
-          alert("Copy failed. You can select and copy manually.");
-        }
+<script>
+  // server-embedded data
+  const feeds = ${JSON.stringify(feeds)};
+
+  const grid = document.getElementById("grid");
+
+  function card(feed){
+    const div = document.createElement("div");
+    div.className = "card";
+
+    const top = document.createElement("div");
+    top.className = "name";
+    const sw = document.createElement("span");
+    sw.className = "swatch";
+    sw.style.background = feed.color;
+    const title = document.createElement("div");
+    title.textContent = feed.name;
+    title.style.fontWeight = "700";
+    top.appendChild(sw);
+    top.appendChild(title);
+
+    const url = document.createElement("div");
+    url.className = "url";
+    url.textContent = feed.url;
+
+    const btnrow = document.createElement("div");
+    btnrow.className = "btnrow";
+
+    const openBtn = document.createElement("button");
+    openBtn.className = "primary";
+    openBtn.textContent = "Open ICS";
+    openBtn.onclick = () => window.open(feed.url, "_blank", "noopener,noreferrer");
+
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "Copy URL";
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(feed.url);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => (copyBtn.textContent = "Copy URL"), 1200);
+      } catch {
+        // fallback
+        const ta = document.createElement("textarea");
+        ta.value = feed.url;
+        document.body.appendChild(ta);
+        ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => (copyBtn.textContent = "Copy URL"), 1200);
       }
-      function flash(el, msg){
-        const old = el.textContent;
-        el.textContent = msg;
-        el.style.outline = "2px solid var(--ring)";
-        setTimeout(()=>{ el.textContent = old; el.style.outline="none"; }, 900);
-      }
-      function openFeed(url){
-        // Opening the .ics directly prompts download in most browsers; Outlook can subscribe via URL
-        window.open(url, "_blank", "noopener,noreferrer");
-      }
-    </script>
-  </body>
-</html>`;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.status(200).send(html);
+    };
+
+    btnrow.appendChild(openBtn);
+    btnrow.appendChild(copyBtn);
+
+    const chips = document.createElement("div");
+    chips.className = "chips";
+    for (const txt of ["allday","rolling","ops feed"]) {
+      const c = document.createElement("span");
+      c.className = "chip";
+      c.textContent = txt;
+      chips.appendChild(c);
+    }
+
+    div.appendChild(top);
+    div.appendChild(url);
+    div.appendChild(btnrow);
+    div.appendChild(chips);
+    return div;
+  }
+
+  feeds.forEach(f => grid.appendChild(card(f)));
+</script>
+</body>
+</html>`);
+  } catch (err) {
+    res.status(500).send(`Error: ${err.message}`);
+  }
 });
 
 
