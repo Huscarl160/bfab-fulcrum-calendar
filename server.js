@@ -25,6 +25,7 @@ if (!TOKEN) {
 
 /* -------------------- express -------------------- */
 const app = express();
+
 app.get("/", (req, res) => res.type("text/plain").send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.get("/wake", (req, res) => res.type("text/plain").send("awake"));
@@ -33,15 +34,25 @@ app.get("/wake", (req, res) => res.type("text/plain").send("awake"));
 function icsEscape(s = "") {
   return String(s || "").replace(/([,;])/g, "\\$1").replace(/\n/g, "\\n");
 }
+
 function toUTC(dt) {
   const d = new Date(dt);
   const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(
+    d.getUTCMinutes()
+  )}${pad(d.getUTCSeconds())}Z`;
 }
+
+function toUTCDateOnly(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
+}
+
 function vevent({ uid, start, end, summary, location, description, categories, allday = false }) {
   const lines = ["BEGIN:VEVENT", `UID:${uid}`, `DTSTAMP:${toUTC(Date.now())}`];
+
   if (allday) {
-    // DTSTART/DTEND as DATE (no time). DTEND is exclusive in RFC5545.
+    // DTSTART/DTEND as DATE (DTEND exclusive per RFC5545)
     const ds = toUTCDateOnly(new Date(start));
     const de = toUTCDateOnly(new Date(end));
     lines.push(`DTSTART;VALUE=DATE:${ds}`);
@@ -50,16 +61,13 @@ function vevent({ uid, start, end, summary, location, description, categories, a
     lines.push(`DTSTART:${toUTC(start)}`);
     lines.push(`DTEND:${toUTC(end || start)}`);
   }
+
   lines.push(`SUMMARY:${icsEscape(summary || "Scheduled Work")}`);
   if (location) lines.push(`LOCATION:${icsEscape(location)}`);
   if (description) lines.push(`DESCRIPTION:${icsEscape(description)}`);
   if (categories && categories.length) lines.push(`CATEGORIES:${categories.map(icsEscape).join(",")}`);
   lines.push("END:VEVENT");
   return lines.join("\r\n");
-}
-function toUTCDateOnly(d) {
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
 }
 
 async function postJson(path, body) {
@@ -75,6 +83,7 @@ async function postJson(path, body) {
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json();
 }
+
 function unwrapItems(raw) {
   if (Array.isArray(raw)) return raw;
   return raw?.items || raw?.results || raw?.data || [];
@@ -95,6 +104,7 @@ function foldLines(text) {
   }
   return out.join("\r\n");
 }
+
 function finalizeIcs(ics) {
   if (!ics.endsWith("\r\n")) ics += "\r\n";
   return foldLines(ics);
@@ -104,12 +114,13 @@ function finalizeIcs(ics) {
 function defaultWindowISO() {
   const today = new Date();
   const startDefault = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 30));
-  const endDefault   = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 180));
+  const endDefault = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 180));
   return {
     since: startDefault.toISOString().slice(0, 10),
     until: endDefault.toISOString().slice(0, 10),
   };
 }
+
 function addDaysISO(isoDate, days) {
   const d = new Date(isoDate);
   d.setUTCDate(d.getUTCDate() + days);
@@ -125,6 +136,7 @@ const JOB_STATUS_WHITELIST = new Set([
   "canceled",
   "onHold",
 ]);
+
 const OP_STATUS_WHITELIST = new Set([
   "pending",
   "ready",
@@ -137,13 +149,15 @@ const OP_STATUS_WHITELIST = new Set([
 
 /* -------------------- API endpoints (declare ONCE) -------------------- */
 const JOBS_LIST = "/api/jobs/list";
-const JOB_OPS_LIST = (jobId) => `/api/jobs/${job.id ?? jobId}/operations/list`; // guarded in use
+const JOB_OPS_LIST = (jobId) => `/api/jobs/${jobId}/operations/list`;
 
 /* -------------------- ops selection & mapping (job->event) -------------------- */
 function pickPrimaryOperation(job, ops) {
   if (!Array.isArray(ops) || ops.length === 0) return null;
 
-  const jStart = new Date(job.scheduledStartUtc || job.originalScheduledStartUtc || job.productionDueDate || 0).getTime();
+  const jStart = new Date(
+    job.scheduledStartUtc || job.originalScheduledStartUtc || job.productionDueDate || 0
+  ).getTime();
   const jEnd = new Date(job.scheduledEndUtc || job.originalScheduledEndUtc || 0).getTime();
 
   const candidates = ops
@@ -155,6 +169,7 @@ function pickPrimaryOperation(job, ops) {
     });
 
   if (!candidates.length) return null;
+
   if (jStart) {
     const overlapping = candidates.find((o) => {
       const os = new Date(o.scheduledStartUtc || o.originalScheduledStartUtc).getTime();
@@ -163,15 +178,16 @@ function pickPrimaryOperation(job, ops) {
     });
     return overlapping || candidates[0];
   }
+
   return candidates[0];
 }
 
 function mapJobToEvent(job, primaryOp, itemToMake) {
   const jobStart = job.scheduledStartUtc || job.originalScheduledStartUtc || job.productionDueDate;
-  const jobEnd   = job.scheduledEndUtc || job.originalScheduledEndUtc;
+  const jobEnd = job.scheduledEndUtc || job.originalScheduledEndUtc;
 
   const opStart = primaryOp?.scheduledStartUtc || primaryOp?.originalScheduledStartUtc;
-  const opEnd   = primaryOp?.scheduledEndUtc || primaryOp?.originalScheduledEndUtc;
+  const opEnd = primaryOp?.scheduledEndUtc || primaryOp?.originalScheduledEndUtc;
 
   const start = opStart || jobStart;
   let end = opEnd || jobEnd;
@@ -181,17 +197,16 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
   const number = job.number != null ? `#${job.number}` : "";
   const status = job.status || "";
   const project = job.salesOrderId || "";
-
   const equipment = primaryOp?.scheduledEquipmentName || "";
   const opName = primaryOp?.name || "";
 
-  const itemName = itemToMake?.itemReference?.name || itemToMake?.itemReference?.number || "";
+  const itemName =
+    itemToMake?.itemReference?.name || itemToMake?.itemReference?.number || "";
   const itemDesc = itemToMake?.itemReference?.description || "";
   const qtyMake = itemToMake?.quantityToMake != null ? `Qty: ${itemToMake.quantityToMake}` : "";
 
   const summary = [title, number, opName ? `(${opName})` : ""].filter(Boolean).join(" ");
   const location = equipment || "";
-
   const descLines = [
     status ? `Status: ${status}` : null,
     project ? `Sales Order: ${project}` : null,
@@ -248,9 +263,11 @@ app.get("/calendar.ics", async (req, res) => {
       .filter((s) => s.length);
 
     const listBody = { limit };
+
     // expand created window
     if (since) listBody.createdAfterUtc = addDaysISO(since, -CREATED_WINDOW_BUFFER_DAYS);
     if (until) listBody.createdBeforeUtc = addDaysISO(until, CREATED_WINDOW_BUFFER_DAYS);
+
     // job status whitelist
     const jobStatuses = statuses.filter((s) => JOB_STATUS_WHITELIST.has(s));
     if (jobStatuses.length) listBody.statuses = jobStatuses;
@@ -259,10 +276,11 @@ app.get("/calendar.ics", async (req, res) => {
     const jobs = unwrapItems(jobsResp);
 
     const primaryOpByJob = new Map();
+
     if (includeOps) {
       for (const job of jobs) {
         try {
-          const opsResp = await postJson(`/api/jobs/${job.id}/operations/list`, { limit: 200 });
+          const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 200 });
           const opsRaw = unwrapItems(opsResp).map((o) => o.operation || o);
           const primary = pickPrimaryOperation(job, opsRaw);
           primaryOpByJob.set(job.id, primary ? { op: primary, itm: null } : null);
@@ -281,12 +299,17 @@ app.get("/calendar.ics", async (req, res) => {
       const op = pair?.op;
 
       const start =
-        op?.scheduledStartUtc || op?.originalScheduledStartUtc ||
-        j.scheduledStartUtc || j.originalScheduledStartUtc || j.productionDueDate;
-
+        op?.scheduledStartUtc ||
+        op?.originalScheduledStartUtc ||
+        j.scheduledStartUtc ||
+        j.originalScheduledStartUtc ||
+        j.productionDueDate;
       const end =
-        op?.scheduledEndUtc || op?.originalScheduledEndUtc ||
-        j.scheduledEndUtc || j.originalScheduledEndUtc || start;
+        op?.scheduledEndUtc ||
+        op?.originalScheduledEndUtc ||
+        j.scheduledEndUtc ||
+        j.originalScheduledEndUtc ||
+        start;
 
       if (!start) return false;
       const s = toMs(start);
@@ -303,27 +326,28 @@ app.get("/calendar.ics", async (req, res) => {
       return mapJobToEvent(j, primaryOp, itemToMake);
     });
 
-    const ics = [
-      "BEGIN:VCALENDAR",
-      "VERSION:2.0",
-      "PRODID:-//Bettis//Fulcrum Jobs Schedule//EN",
-      "CALSCALE:GREGORIAN",
-      "METHOD:PUBLISH",
-      "X-WR-CALNAME:Fulcrum Schedule",
-      "X-WR-TIMEZONE:UTC",
-      ...events.map((e) =>
-        vevent({
-          uid: crypto.createHash("sha1").update(`fulcrum:${e.id}`).digest("hex") + "@bettis",
-          start: e.start,
-          end: e.end,
-          summary: e.summary,
-          location: e.location,
-          description: e.description,
-          categories: e.categories,
-        })
-      ),
-      "END:VCALENDAR",
-    ].join("\r\n");
+    const ics =
+      [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Bettis//Fulcrum Jobs Schedule//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Fulcrum Schedule",
+        "X-WR-TIMEZONE:UTC",
+        ...events.map((e) =>
+          vevent({
+            uid: crypto.createHash("sha1").update(`fulcrum:${e.id}`).digest("hex") + "@bettis",
+            start: e.start,
+            end: e.end,
+            summary: e.summary,
+            location: e.location,
+            description: e.description,
+            categories: e.categories,
+          })
+        ),
+        "END:VCALENDAR",
+      ].join("\r\n");
 
     const safeIcs = finalizeIcs(ics);
     const etag = 'W/"' + crypto.createHash("sha1").update(safeIcs).digest("hex") + '"';
@@ -340,7 +364,7 @@ app.get("/calendar.ics", async (req, res) => {
 });
 
 /* -------------------- OPS-DRIVEN ICS (per-op friendly) -------------------- */
-// /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&op=Laser%20Cut&statuses=ready,inProgress,paused,pending
+// /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Laser%20Cut&statuses=ready,inProgress,paused,pending
 app.get("/calendar-ops.ics", async (req, res) => {
   try {
     if (ACCESS_KEY && req.query.key !== ACCESS_KEY) return res.sendStatus(403);
@@ -368,55 +392,63 @@ app.get("/calendar-ops.ics", async (req, res) => {
       ? String(req.query.statuses).split(",").map((s) => s.trim()).filter(Boolean)
       : [];
     const jobStatuses = rawStatuses.filter((s) => JOB_STATUS_WHITELIST.has(s));
-    const opStatuses  = rawStatuses.filter((s) => OP_STATUS_WHITELIST.has(s));
+    const opStatuses = rawStatuses.filter((s) => OP_STATUS_WHITELIST.has(s));
 
-    // optional single-operation filter for per-op feeds
-    const opNameFilter = req.query.op ? String(req.query.op).trim() : null;
+    // optional single-operation filter
+    const onlyOp = req.query.only ? String(req.query.only).toLowerCase() : null;
 
     // jobs list body (created window around schedule window)
     const listBody = { limit };
-    if (since) listBody.createdAfterUtc  = addDaysISO(since, -CREATED_WINDOW_BUFFER_DAYS);
-    if (until) listBody.createdBeforeUtc = addDaysISO(until,  CREATED_WINDOW_BUFFER_DAYS);
+    if (since) listBody.createdAfterUtc = addDaysISO(since, -CREATED_WINDOW_BUFFER_DAYS);
+    if (until) listBody.createdBeforeUtc = addDaysISO(until, CREATED_WINDOW_BUFFER_DAYS);
     if (jobStatuses.length) listBody.statuses = jobStatuses;
 
     const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
-    // fetch ops per job; client-filter by op status and op name
-    // optional: client-side op-status + operation-name filtering
-    const onlyOp = req.query.only ? String(req.query.only).toLowerCase() : null;
+    // Fetch ops per job and filter by status/name here
+    const opMap = new Map(); // jobId -> filtered ops[]
+    for (const job of jobs) {
+      try {
+        const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 500 });
+        const ops = unwrapItems(opsResp).map((o) => o.operation || o);
 
-    const arrFiltered = arr.filter(o => {
-        const opStatus = String(o.status || "");
-        const allowedByStatus = opStatuses.length
-            ? (OP_STATUS_WHITELIST.has(opStatus) && opStatuses.includes(opStatus))
-            : true;
+        const filtered = ops.filter((o) => {
+          const opStatus = String(o.status || "");
+          const allowedByStatus = opStatuses.length ? opStatuses.includes(opStatus) : true;
+          const allowedByName = onlyOp ? String(o.name || "").toLowerCase().includes(onlyOp) : true;
+          return allowedByStatus && allowedByName;
+        });
 
-        const allowedByName = onlyOp
-            ? String(o.name || "").toLowerCase().includes(onlyOp)
-            : true;
+        opMap.set(job.id, filtered);
+      } catch {
+        opMap.set(job.id, []);
+      }
+    }
 
-        return allowedByStatus && allowedByName;
-    });
-
-
-    // build events (one VEVENT per primary op per job, same logic as before)
+    // build events (primary op per job)
     const winStart = new Date(since).getTime();
-    const winEnd   = new Date(until).getTime();
-
+    const winEnd = new Date(until).getTime();
     const events = [];
+
     for (const job of jobs) {
       const ops = opMap.get(job.id) || [];
       const primary = pickPrimaryOperation(job, ops);
 
       // compute times using op if available, otherwise job
       const startIso =
-        primary?.scheduledStartUtc || primary?.originalScheduledStartUtc ||
-        job.scheduledStartUtc || job.originalScheduledStartUtc || job.productionDueDate;
+        primary?.scheduledStartUtc ||
+        primary?.originalScheduledStartUtc ||
+        job.scheduledStartUtc ||
+        job.originalScheduledStartUtc ||
+        job.productionDueDate;
 
       let endIso =
-        primary?.scheduledEndUtc || primary?.originalScheduledEndUtc ||
-        job.scheduledEndUtc || job.originalScheduledEndUtc || startIso;
+        primary?.scheduledEndUtc ||
+        primary?.originalScheduledEndUtc ||
+        job.scheduledEndUtc ||
+        job.originalScheduledEndUtc ||
+        startIso;
 
       if (!startIso) continue;
 
@@ -430,7 +462,6 @@ app.get("/calendar-ops.ics", async (req, res) => {
       let alldayStart = startIso;
       let alldayEnd = endIso;
       if (wantAllDay) {
-        // coerce to date-only boundaries
         const sDate = new Date(Date.UTC(new Date(sMs).getUTCFullYear(), new Date(sMs).getUTCMonth(), new Date(sMs).getUTCDate()));
         const eDate = new Date(Date.UTC(new Date(eMs).getUTCFullYear(), new Date(eMs).getUTCMonth(), new Date(eMs).getUTCDate() + 1)); // exclusive
         alldayStart = sDate.toISOString();
@@ -438,38 +469,36 @@ app.get("/calendar-ops.ics", async (req, res) => {
       }
 
       const ev = mapJobToEvent(job, primary || null, null);
-      // override event times with processed times
       ev.start = alldayStart;
-      ev.end   = alldayEnd;
-
+      ev.end = alldayEnd;
       events.push(ev);
     }
 
-    const ics = [
-      "BEGIN:VCALENDAR",
-      "VERSION:2.0",
-      "PRODID:-//Bettis//Fulcrum Ops Schedule//EN",
-      "CALSCALE:GREGORIAN",
-      "METHOD:PUBLISH",
-      "X-WR-CALNAME:Fulcrum Ops",
-      "X-WR-TIMEZONE:UTC",
-      ...events.map((e) =>
-        vevent({
-          uid: crypto.createHash("sha1").update(`fulcrum:${e.id}:${e.start}`).digest("hex") + "@bettis",
-          start: e.start,
-          end: e.end,
-          summary: e.summary,
-          location: e.location,
-          description: e.description,
-          categories: e.categories,
-          allday: wantAllDay,
-        })
-      ),
-      "END:VCALENDAR",
-    ].join("\r\n");
+    const ics =
+      [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Bettis//Fulcrum Ops Schedule//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Fulcrum Ops",
+        "X-WR-TIMEZONE:UTC",
+        ...events.map((e) =>
+          vevent({
+            uid: crypto.createHash("sha1").update(`fulcrum:${e.id}:${e.start}`).digest("hex") + "@bettis",
+            start: e.start,
+            end: e.end,
+            summary: e.summary,
+            location: e.location,
+            description: e.description,
+            categories: e.categories,
+            allday: wantAllDay,
+          })
+        ),
+        "END:VCALENDAR",
+      ].join("\r\n");
 
     const safeIcs = finalizeIcs(ics);
-
     const etag = 'W/"' + crypto.createHash("sha1").update(safeIcs).digest("hex") + '"';
     cache.set(key, { at: now, body: safeIcs, etag });
 
@@ -483,176 +512,8 @@ app.get("/calendar-ops.ics", async (req, res) => {
   }
 });
 
-/* -------------------- FEEDS index  -------------------- */
-// Lists handy per-op URLs (rolling window, all-day). Copy-paste into Outlook.
-// Pretty feeds index (HTML)
-/* -------------------- feeds.css (dark theme) -------------------- */
-app.get("/feeds.css", (req, res) => {
-  const css = `
-    :root{
-      --bg:#0b1418;
-      --card:#101b20;
-      --ink:#d7e5e8;
-      --muted:#9fb2b6;
-      --brand:#00a2b1; /* Bettis teal-ish */
-      --brand-2:#05424a;
-      --ring:rgba(0,255,255,0.2);
-    }
-    *{box-sizing:border-box}
-    html,body{height:100%}
-    body{
-      margin:0;
-      font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji;
-      background: radial-gradient(1200px 700px at 20% -10%, #0d1f24 0%, var(--bg) 50%), var(--bg);
-      color: var(--ink);
-      padding: 2rem;
-    }
-    .wrap{max-width:1000px;margin:0 auto}
-    h1{
-      font-weight:700;
-      font-size: clamp(1.2rem, 1rem + 1.2vw, 2rem);
-      text-align:center;
-      margin:0 0 1.25rem 0;
-      color:#e6fbff;
-      letter-spacing:.2px;
-    }
-    .desc{
-      text-align:center;
-      color:var(--muted);
-      margin:0 0 2rem 0;
-      font-size:.98rem;
-    }
-    .grid{
-      display:grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 1rem;
-    }
-    .card{
-      background: linear-gradient(180deg, var(--card), #0e171b);
-      border: 1px solid rgba(255,255,255,0.05);
-      border-radius: 14px;
-      padding: 1rem;
-      box-shadow: 0 10px 24px rgba(0,0,0,0.25);
-    }
-    .op-title{
-      display:flex; align-items:center; gap:.6rem;
-      font-weight:600;
-      margin-bottom:.75rem;
-      letter-spacing:.2px;
-    }
-    .swatch{
-      width:12px;height:12px;border-radius:3px;flex:0 0 auto;box-shadow:0 0 0 2px #000 inset;
-    }
-    .url-row{
-      display:flex; gap:.5rem; align-items:center;
-      margin-top:.5rem; flex-wrap:wrap;
-    }
-    .url{
-      flex:1 1 auto;
-      background:#0b1214;
-      color:#bfe7ec;
-      border:1px solid #12343a;
-      border-radius:10px;
-      padding:.6rem .7rem;
-      font-size:.85rem;
-      overflow:auto;
-      white-space:nowrap;
-    }
-    .btns{display:flex; gap:.5rem; margin-top:.7rem; flex-wrap:wrap;}
-    .btn{
-      appearance:none; border:0; cursor:pointer;
-      background: linear-gradient(180deg, var(--brand), var(--brand-2));
-      color:#eaffff; padding:.6rem .8rem; border-radius:10px;
-      font-weight:600; font-size:.9rem; letter-spacing:.2px;
-      transition: transform .08s ease, box-shadow .08s ease;
-      box-shadow: 0 6px 16px rgba(0, 255, 255, .12);
-    }
-    .btn:hover{ transform: translateY(-1px); box-shadow: 0 10px 24px rgba(0, 255, 255, .15);}
-    .btn.secondary{
-      background: linear-gradient(180deg, #1b2c31, #172327);
-      color:#c7e6ea;
-      border:1px solid #12343a;
-      box-shadow:none;
-    }
-    .foot{
-      text-align:center;
-      color:var(--muted);
-      margin-top:2rem;
-      font-size:.85rem;
-    }
-    .tiny{color:#7aa1a7; font-size:.85rem}
-    .ok{color:#9cffd7}
-    .err{color:#ff9c9c}
-    .pill{
-      display:inline-block; padding:.15rem .45rem; border-radius:999px;
-      border:1px solid #1b3236; background:#0e171b; color:#a4cad0; font-size:.75rem; margin-left:.35rem;
-    }
-  `;
-  res.setHeader("Content-Type", "text/css; charset=utf-8");
-  res.status(200).send(css);
-});
-
-/* -------------------- feeds.css route -------------------- */
-app.get("/feeds.css", (req, res) => {
-  const css = `
-    body {
-      font-family: system-ui, sans-serif;
-      background: #f8fafc;
-      color: #0f172a;
-      padding: 2rem;
-      line-height: 1.6;
-    }
-    h1 {
-      color: #004c50;
-      text-align: center;
-      margin-bottom: 1.5rem;
-      font-size: 1.75rem;
-    }
-    .feed-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: 1rem;
-      max-width: 900px;
-      margin: 0 auto;
-    }
-    a.feed {
-      display: block;
-      padding: 1.25rem;
-      background: white;
-      border-radius: 0.75rem;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-      text-decoration: none;
-      color: #0f172a;
-      transition: all 0.15s ease-in-out;
-      border-left: 5px solid #004c50;
-    }
-    a.feed:hover {
-      transform: translateY(-3px);
-      box-shadow: 0 4px 12px rgba(0,0,0,0.12);
-      background: #f1f5f9;
-    }
-    .feed-title {
-      font-weight: 600;
-      font-size: 1.1rem;
-      margin-bottom: 0.25rem;
-    }
-    .feed-desc {
-      font-size: 0.9rem;
-      color: #475569;
-    }
-    footer {
-      text-align: center;
-      margin-top: 2rem;
-      font-size: 0.85rem;
-      color: #64748b;
-    }
-  `;
-  res.setHeader("Content-Type", "text/css; charset=utf-8");
-  res.status(200).send(css);
-});
-
-
-// ---------- Pretty feeds page (dark, buttons, copy/open) with robust discovery + fallback ----------
+/* -------------------- Pretty feeds page (SIMPLE LIST) -------------------- */
+// Requirements: list only; show name + color + hex; "Open ICS" + "Copy URL" buttons; no URL text; no tags; sorted by name.
 app.get("/feeds", async (req, res) => {
   try {
     // Rolling created window to discover ops reliably
@@ -664,8 +525,8 @@ app.get("/feeds", async (req, res) => {
       return x.toISOString();
     };
 
-    const discoverStartISO = addDays(today, -365); // look back 1 year
-    const discoverEndISO   = addDays(today, +60);  // a bit ahead just in case
+    const discoverStartISO = addDays(today, -365);
+    const discoverEndISO = addDays(today, +60);
 
     const jobsResp = await postJson(JOBS_LIST, {
       limit: 300,
@@ -674,7 +535,7 @@ app.get("/feeds", async (req, res) => {
     });
     const jobs = unwrapItems(jobsResp);
 
-    // Gather operation names from a reasonable subset
+    // Gather operation names
     const opNames = new Set();
     let scannedJobs = 0;
     let perJobErrors = 0;
@@ -683,7 +544,7 @@ app.get("/feeds", async (req, res) => {
       scannedJobs++;
       try {
         const opsResp = await postJson(JOB_OPS_LIST(j.id), { limit: 500 });
-        const ops = unwrapItems(opsResp).map(o => o.operation || o);
+        const ops = unwrapItems(opsResp).map((o) => o.operation || o);
         for (const o of ops) {
           if (o?.name && typeof o.name === "string") {
             opNames.add(o.name);
@@ -692,7 +553,7 @@ app.get("/feeds", async (req, res) => {
       } catch {
         perJobErrors++;
       }
-      if (opNames.size >= 60) break; // cap discovery to keep page snappy
+      if (opNames.size >= 60) break; // cap discovery
     }
 
     // Suggested colors for known ops
@@ -711,41 +572,50 @@ app.get("/feeds", async (req, res) => {
       "OS Processing": "#64748b",
       "CAD / Engineering": "#60a5fa",
       "Trucking": "#84cc16",
-      "Office / OH / Burden": "#94a3b8"
+      "Office / OH / Burden": "#94a3b8",
     };
 
-    // Fallback list if discovery found nothing
     const fallbackOps = [
-      "Laser Cut","Press Brake","Saw","Drill","Shear","Weld","Cobot Weld",
-      "Sand Blast / Clean","Paint","Packaging","Flex","OS Processing",
-      "CAD / Engineering","Trucking","Office / OH / Burden"
+      "Laser Cut",
+      "Press Brake",
+      "Saw",
+      "Drill",
+      "Shear",
+      "Weld",
+      "Cobot Weld",
+      "Sand Blast / Clean",
+      "Paint",
+      "Packaging",
+      "Flex",
+      "OS Processing",
+      "CAD / Engineering",
+      "Trucking",
+      "Office / OH / Burden",
     ];
 
     // Rolling window for feed URLs (past 14, next 60)
-    const start = new Date(today); start.setUTCDate(start.getUTCDate() - 14);
-    const end   = new Date(today); end.setUTCDate(end.getUTCDate() + 60);
+    const start = new Date(today);
+    start.setUTCDate(start.getUTCDate() - 14);
+    const end = new Date(today);
+    end.setUTCDate(end.getUTCDate() + 60);
     const s = isoDate(start);
     const u = isoDate(end);
-
     const baseUrl = `${req.protocol}://${req.get("host")}`;
     const defaultStatuses = "scheduled,inProgress,ready,pending,paused";
 
-    const names = opNames.size ? Array.from(opNames).sort()
-                               : fallbackOps;
+    const names = (opNames.size ? Array.from(opNames) : fallbackOps).sort((a, b) =>
+      a.localeCompare(b, undefined, { sensitivity: "base" })
+    );
 
-    const feeds = names.map(name => {
+    const feeds = names.map((name) => {
       const only = encodeURIComponent(name);
       const url =
         `${baseUrl}/calendar-ops.ics?only=${only}` +
         `&s=${s}&u=${u}&allday=1&limit=500&statuses=${encodeURIComponent(defaultStatuses)}`;
-      return {
-        name,
-        url,
-        color: colorMap[name] || "#6b7280"
-      };
+      return { name, url, color: colorMap[name] || "#6b7280" };
     });
 
-    // Render page
+    // Render simple list; no URL text; buttons only
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(`<!doctype html>
 <html lang="en">
@@ -754,69 +624,59 @@ app.get("/feeds", async (req, res) => {
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Fulcrum Operation Feeds</title>
 <style>
-  :root{ --bg:#0b1220; --panel:#111827; --muted:#9ca3af; --fg:#e5e7eb; --accent:#38bdf8; --card:#0f172a; --chip:#1f2937; }
+  :root { --ink:#0f172a; --muted:#475569; --teal:#004c50; --bg:#f8fafc; --card:#ffffff; --bd:#e2e8f0; }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial}
-  header{max-width:1100px;margin:32px auto 0;padding:0 16px}
-  h1{margin:0 0 4px 0;font-size:28px;font-weight:700}
-  p.sub{margin:0 0 12px;color:var(--muted)}
-  .panel{max-width:1100px;margin:16px auto;padding:0 16px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-  .card{background:var(--card);border:1px solid #1f2937;border-radius:14px;padding:14px;box-shadow:0 10px 18px rgba(0,0,0,.25)}
-  .name{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-  .swatch{width:14px;height:14px;border-radius:3px;border:1px solid rgba(255,255,255,.25);flex:0 0 auto}
-  .url{font-size:12px;color:var(--muted);word-break:break-all;margin:8px 0 12px}
-  .btnrow{display:flex;gap:8px;flex-wrap:wrap}
-  button{appearance:none;border:1px solid #334155;background:#0b1220;color:var(--fg);padding:8px 10px;border-radius:10px;cursor:pointer}
-  button.primary{background:var(--accent);color:#001018;border:none}
+  body{margin:0; background:var(--bg); color:var(--ink); font-family:ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial;}
+  main{max-width:900px; margin:32px auto; padding:0 16px;}
+  h1{margin:0 0 6px; color:var(--teal); font-size:28px; font-weight:800;}
+  p.sub{margin:0 0 16px; color:var(--muted);}
+
+  ul.list{list-style:none; padding:0; margin:16px 0 0;}
+  li.row{
+    display:flex; align-items:center; gap:12px; padding:12px 14px;
+    background:var(--card); border:1px solid var(--bd); border-radius:12px; margin-bottom:10px;
+  }
+  .name{font-weight:700; flex:1 1 auto;}
+  .sw{width:16px; height:16px; border-radius:4px; border:1px solid rgba(0,0,0,0.1);}
+  .hex{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:var(--muted); font-size:12px;}
+  button{appearance:none; border:1px solid var(--bd); background:#eef2f7; color:#0f172a; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:600;}
+  button.primary{background:#11b0bd; color:#001317; border:0;}
   button:active{transform:translateY(1px)}
-  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
-  .chip{background:var(--chip);color:var(--muted);border-radius:999px;padding:4px 10px;font-size:12px;border:1px solid #374151}
-  footer{max-width:1100px;margin:18px auto 40px;color:var(--muted);font-size:12px;padding:0 16px}
-  .debug{margin-top:8px;font-size:12px;color:#9ca3af}
+  footer{margin-top:18px; color:var(--muted); font-size:12px;}
+  .debug{margin-top:6px; color:#64748b; font-size:12px;}
 </style>
 </head>
 <body>
-  <header>
+  <main>
     <h1>Fulcrum Operation Feeds</h1>
-    <p class="sub">Copy or open an ICS feed for a specific operation. Links use a rolling window (past 14 → next 60 days).</p>
-  </header>
-  <section class="panel">
-    <div id="grid" class="grid"></div>
-    <div class="debug">
-      Discovered ops: ${opNames.size} | Jobs scanned: ${scannedJobs}${opNames.size ? "" : " | Using fallback list"}
-      ${perJobErrors ? " | Per-job errors: " + perJobErrors : ""}
-    </div>
-  </section>
-  <footer>
-    Tip: Add multiple feeds to Outlook and color-code each one. Rolling dates prevent stale calendars.
-  </footer>
+    <p class="sub">Each feed is an ICS for a specific operation (rolling: past 14 → next 60 days).</p>
+
+    <ul class="list" id="feedList"></ul>
+
+    <footer>Tip: add multiple feeds to Outlook and color-code by operation.</footer>
+    <div class="debug">Discovered ops: ${opNames.size} | Jobs scanned: ${scannedJobs}${opNames.size ? "" : " | Using fallback list"}${perJobErrors ? " | Per-job errors: " + perJobErrors : ""}</div>
+  </main>
 
 <script>
   const feeds = ${JSON.stringify(feeds)};
-  const grid = document.getElementById("grid");
 
-  function card(feed){
-    const div = document.createElement("div");
-    div.className = "card";
+  const list = document.getElementById("feedList");
 
-    const top = document.createElement("div");
-    top.className = "name";
+  function row(feed){
+    const li = document.createElement("li");
+    li.className = "row";
+
     const sw = document.createElement("span");
-    sw.className = "swatch";
+    sw.className = "sw";
     sw.style.background = feed.color;
-    const title = document.createElement("div");
-    title.textContent = feed.name;
-    title.style.fontWeight = "700";
-    top.appendChild(sw);
-    top.appendChild(title);
 
-    const url = document.createElement("div");
-    url.className = "url";
-    url.textContent = feed.url;
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = feed.name;
 
-    const btnrow = document.createElement("div");
-    btnrow.className = "btnrow";
+    const hex = document.createElement("span");
+    hex.className = "hex";
+    hex.textContent = feed.color;
 
     const openBtn = document.createElement("button");
     openBtn.className = "primary";
@@ -834,32 +694,23 @@ app.get("/feeds", async (req, res) => {
         const ta = document.createElement("textarea");
         ta.value = feed.url;
         document.body.appendChild(ta);
-        ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
         copyBtn.textContent = "Copied!";
         setTimeout(() => (copyBtn.textContent = "Copy URL"), 1200);
       }
     };
 
-    btnrow.appendChild(openBtn);
-    btnrow.appendChild(copyBtn);
-
-    const chips = document.createElement("div");
-    chips.className = "chips";
-    for (const txt of ["allday","rolling","ops feed"]) {
-      const c = document.createElement("span");
-      c.className = "chip";
-      c.textContent = txt;
-      chips.appendChild(c);
-    }
-
-    div.appendChild(top);
-    div.appendChild(url);
-    div.appendChild(btnrow);
-    div.appendChild(chips);
-    return div;
+    li.appendChild(sw);
+    li.appendChild(name);
+    li.appendChild(hex);
+    li.appendChild(openBtn);
+    li.appendChild(copyBtn);
+    return li;
   }
 
-  feeds.forEach(f => grid.appendChild(card(f)));
+  feeds.forEach(f => list.appendChild(row(f)));
 </script>
 </body>
 </html>`);
@@ -868,30 +719,29 @@ app.get("/feeds", async (req, res) => {
   }
 });
 
-
-
 /* -------------------- test -------------------- */
 app.get("/test.ics", (req, res) => {
   const now = new Date();
   const in30 = new Date(now.getTime() + 30 * 60 * 1000);
-  const ics = [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//Bettis//Fulcrum Test//EN",
-    "CALSCALE:GREGORIAN",
-    "METHOD:PUBLISH",
-    "X-WR-CALNAME:Fulcrum Test",
-    "X-WR-TIMEZONE:UTC",
-    "BEGIN:VEVENT",
-    "UID:test-one@bettis",
-    `DTSTAMP:${toUTC(now)}`,
-    `DTSTART:${toUTC(now)}`,
-    `DTEND:${toUTC(in30)}`,
-    "SUMMARY:Test Event (should appear today)",
-    "DESCRIPTION:This is a diagnostic VEVENT\\nIf you can see this, Outlook is rendering.",
-    "END:VEVENT",
-    "END:VCALENDAR",
-  ].join("\r\n") + "\r\n";
+  const ics =
+    [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Bettis//Fulcrum Test//EN",
+      "CALSCALE:GREGORIAN",
+      "METHOD:PUBLISH",
+      "X-WR-CALNAME:Fulcrum Test",
+      "X-WR-TIMEZONE:UTC",
+      "BEGIN:VEVENT",
+      "UID:test-one@bettis",
+      `DTSTAMP:${toUTC(now)}`,
+      `DTSTART:${toUTC(now)}`,
+      `DTEND:${toUTC(in30)}`,
+      "SUMMARY:Test Event (should appear today)",
+      "DESCRIPTION:This is a diagnostic VEVENT\\nIf you can see this, Outlook is rendering.",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n") + "\r\n";
 
   res.setHeader("Content-Type", "text/calendar; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
