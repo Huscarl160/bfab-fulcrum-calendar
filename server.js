@@ -19,7 +19,7 @@ const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
 const FEEDS_CACHE_TTL_SECONDS = Number(process.env.FEEDS_CACHE_TTL_SECONDS || 900); // 15 min
 const feedsCache = { at: 0, payload: null };
-const FULCRUM_UI_BASE = process.env.FULCRUM_UI_BASE || "https://bettis.fulcrumpro.com";
+const FULCRUM_UI_BASE = process.env.FULCRUM_UI_BASE || "https://bettis.fulcrumpro.com/ui/items";
 
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
@@ -135,10 +135,12 @@ function addDaysISO(isoDate, days) {
   return d.toISOString();
 }
 
+// Try hard to extract a clean client/customer label from the job
 function getClientName(job) {
   return (
     job?.customerName ||
     job?.customer?.name ||
+    job?.customer?.displayName ||
     job?.client ||
     job?.accountName ||
     job?.customer ||
@@ -146,38 +148,37 @@ function getClientName(job) {
   );
 }
 
+// Build: "<number> <name>, <description>" with lots of fallbacks
 function buildItemLabel(op) {
-  const ref = op?.itemReference || {};
-  const parts = [];
-  if (ref.number) parts.push(String(ref.number));
-  // Join name + description with a comma if both exist
-  const nameDesc = [ref.name, ref.description].filter(Boolean).join(", ");
-  if (nameDesc) parts.push(nameDesc);
-  else if (op?.description) parts.push(op.description);
-  else if (op?.name) parts.push(op.name);
-  return parts.join(" ").replace(/\s+/g, " ").trim();
+  const r = op?.itemReference || {};
+  const name   = r.name || r.itemName || op?.name || "";
+  const desc   = r.description || r.itemDescription || op?.description || "";
+
+  const left  = [name].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const right = [desc].filter(Boolean).join(", ").replace(/\s+/g, " ").trim();
+
+  return right ? `${left} ${left ? "" : ""}${right ? `, ${right}` : ""}`.trim() : left || (op?.id ? `Item ${op.id}` : "Item");
 }
 
+// Build https://bettis.fulcrumpro.com/ui/items/<id>
 function itemUrl(op) {
   if (!FULCRUM_UI_BASE) return null;
-  const base = String(FULCRUM_UI_BASE).replace(/\/+$/, "");
+  const base = String(FULCRUM_UI_BASE).replace(/\/+$/, ""); // no trailing slash
   const id =
     op?.itemReference?.id ||
     op?.itemReferenceId ||
     op?.itemId ||
     op?.id ||
     null;
-  if (!id) return null;
-  return `${base}/items/${encodeURIComponent(id)}`;
+  return id ? `${base}/${encodeURIComponent(id)}` : null;
 }
 
-// Replaces the old opLine
+// One line per item inside the aggregated DESCRIPTION
 function opLine(job, op, startIso, endIso) {
-  const label = buildItemLabel(op) || (op?.id ? `Item ${op.id}` : "Item");
+  const label = buildItemLabel(op);
   const when = `${humanUTC(startIso)} → ${humanUTC(endIso)}`;
   const equip = op?.scheduledEquipmentName ? ` | Equip: ${op.scheduledEquipmentName}` : "";
   const url = itemUrl(op);
-  // Many calendar clients auto-link full URLs in DESCRIPTION.
   const linkPart = url ? ` | ${url}` : "";
   return `- ${label} | ${when}${equip}${linkPart}`;
 }
@@ -477,8 +478,7 @@ function mapOpToEvent(job, op) {
 function humanUTC(iso) {
   const d = new Date(iso);
   const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
-         `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
 }
 
 // /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Saw&statuses=ready,inProgress,paused,pending
@@ -609,7 +609,7 @@ app.get("/calendar-ops.ics", async (req, res) => {
       const headerLines = [
         `Job: ${[jobNum, jobTitle].filter(Boolean).join(" — ")}`,
         `Operation: ${opName}`,
-        clientName ? `Client: ${clientName}` : null,
+        clientName ? `Client: ${clientName}` : null,   // <-- add/keep this
         job.status ? `Status: ${job.status}` : null,
         equipments.length ? `Equipment: ${equipments.join(", ")}` : null,
         `Span: ${humanUTC(startIso)} → ${humanUTC(endIso)}`
