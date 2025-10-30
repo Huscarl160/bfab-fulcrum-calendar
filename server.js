@@ -19,6 +19,7 @@ const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
 const FEEDS_CACHE_TTL_SECONDS = Number(process.env.FEEDS_CACHE_TTL_SECONDS || 900); // 15 min
 const feedsCache = { at: 0, payload: null };
+const FULCRUM_UI_BASE = process.env.FULCRUM_UI_BASE || "https://bettis.fulcrumpro.com";
 
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
@@ -133,6 +134,60 @@ function addDaysISO(isoDate, days) {
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString();
 }
+
+function getClientName(job) {
+  return (
+    job?.customerName ||
+    job?.customer?.name ||
+    job?.client ||
+    job?.accountName ||
+    job?.customer ||
+    null
+  );
+}
+
+function buildItemLabel(op) {
+  const ref = op?.itemReference || {};
+  const parts = [];
+  if (ref.number) parts.push(String(ref.number));
+  // Join name + description with a comma if both exist
+  const nameDesc = [ref.name, ref.description].filter(Boolean).join(", ");
+  if (nameDesc) parts.push(nameDesc);
+  else if (op?.description) parts.push(op.description);
+  else if (op?.name) parts.push(op.name);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function itemUrl(op) {
+  if (!FULCRUM_UI_BASE) return null;
+  const base = String(FULCRUM_UI_BASE).replace(/\/+$/, "");
+  const id =
+    op?.itemReference?.id ||
+    op?.itemReferenceId ||
+    op?.itemId ||
+    op?.id ||
+    null;
+  if (!id) return null;
+  return `${base}/items/${encodeURIComponent(id)}`;
+}
+
+function humanUTC(iso) {
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
+}
+
+// Replaces the old opLine
+function opLine(job, op, startIso, endIso) {
+  const label = buildItemLabel(op) || (op?.id ? `Item ${op.id}` : "Item");
+  const when = `${humanUTC(startIso)} → ${humanUTC(endIso)}`;
+  const equip = op?.scheduledEquipmentName ? ` | Equip: ${op.scheduledEquipmentName}` : "";
+  const url = itemUrl(op);
+  // Many calendar clients auto-link full URLs in DESCRIPTION.
+  const linkPart = url ? ` | ${url}` : "";
+  return `- ${label} | ${when}${equip}${linkPart}`;
+}
+
 
 /* ----- whitelists (exact casing your tenant expects) ----- */
 const JOB_STATUS_WHITELIST = new Set([
@@ -567,9 +622,12 @@ app.get("/calendar-ops.ics", async (req, res) => {
         opName, "—", jobNum ? `${jobNum}:` : "", jobTitle, itemCount > 1 ? `(${itemCount} items)` : ""
       ].filter(Boolean).join(" ").replace(/\s+/g, " ");
 
+      const clientName = getClientName(job);
+
       const headerLines = [
         `Job: ${[jobNum, jobTitle].filter(Boolean).join(" — ")}`,
         `Operation: ${opName}`,
+        clientName ? `Client: ${clientName}` : null,
         job.status ? `Status: ${job.status}` : null,
         equipments.length ? `Equipment: ${equipments.join(", ")}` : null,
         `Span: ${humanUTC(startIso)} → ${humanUTC(endIso)}`
