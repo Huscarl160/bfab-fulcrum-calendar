@@ -17,6 +17,8 @@ const TOKEN = process.env.FULCRUM_TOKEN;
 const ACCESS_KEY = process.env.ACCESS_KEY || null;
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
+const FEEDS_CACHE_TTL_SECONDS = Number(process.env.FEEDS_CACHE_TTL_SECONDS || 900); // 15 min
+const feedsCache = { at: 0, payload: null };
 
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
@@ -74,7 +76,6 @@ function vevent({ uid, start, end, summary, location, description, categories, a
   lines.push("END:VEVENT");
   return lines.join("\r\n");
 }
-
 
 async function postJson(path, body) {
   const res = await fetch(`${BASE}${path}`, {
@@ -369,7 +370,6 @@ app.get("/calendar.ics", async (req, res) => {
   }
 });
 
-
 /* -------------------- Change to calendar-ops.ics field mapping -------------------- */
 function mapOpToEvent(job, op) {
   const start =
@@ -392,9 +392,8 @@ function mapOpToEvent(job, op) {
   const summary = [opName, "—", jobNum ? `${jobNum}:` : "", jobTitle]
     .filter(Boolean)
     .join(" ")
-    .replace(/\s+/g, " "); // tidy spacing
+    .replace(/\s+/g, " ");
 
-  // Build a human-friendly date span in UTC for the description
   const fmt = (iso) => {
     const d = new Date(iso);
     const pad = (n) => String(n).padStart(2, "0");
@@ -424,8 +423,6 @@ function mapOpToEvent(job, op) {
     categories,
   };
 }
-
-
 
 /* -------------------- OPS-DRIVEN ICS (per-op friendly) -------------------- */
 // /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Laser%20Cut&statuses=ready,inProgress,paused,pending
@@ -470,51 +467,69 @@ app.get("/calendar-ops.ics", async (req, res) => {
     const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
-    // Fetch ops per job, then filter to matching ops.
-    // If onlyOp is present, we require at least one matching op or we skip the job entirely.
-    // build events (ONE VEVENT PER MATCHING OP)
-const winStart = new Date(since).getTime();
-const winEnd = new Date(until).getTime();
-const events = [];
-
-for (const job of jobs) {
-  const ops = opMap.get(job.id) || [];
-
-  for (const op of ops) {
-    // Require operation-level times for per-op feeds
-    const startIso = op?.scheduledStartUtc || op?.originalScheduledStartUtc || null;
-    let endIso = op?.scheduledEndUtc || op?.originalScheduledEndUtc || startIso;
-    if (!startIso) continue;
-
-    // window clip on op times
-    const sMs = new Date(startIso).getTime();
-    const eMs = new Date(endIso).getTime() || sMs;
-    if (eMs < winStart) continue;
-    if (sMs > winEnd) continue;
-
-    // map event with our new field layout
-    const ev = mapOpToEvent(job, op);
-    if (!ev) continue;
-
-    // allday support (exclusive DTEND)
-    if (wantAllDay) {
-      const sDate = new Date(Date.UTC(new Date(sMs).getUTCFullYear(), new Date(sMs).getUTCMonth(), new Date(sMs).getUTCDate()));
-      const eDate = new Date(Date.UTC(new Date(eMs).getUTCFullYear(), new Date(eMs).getUTCMonth(), new Date(eMs).getUTCDate() + 1));
-      ev.start = sDate.toISOString();
-      ev.end = eDate.toISOString();
+    // Fetch ops per job and filter by status/name into opMap
+    const opMap = new Map(); // jobId -> filtered ops[]
+    for (const job of jobs) {
+      try {
+        const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 500 });
+        const ops = unwrapItems(opsResp).map((o) => o.operation || o);
+        const filtered = ops.filter((o) => {
+          const opStatus = String(o.status || "");
+          const allowedByStatus = opStatuses.length ? opStatuses.includes(opStatus) : true;
+          const allowedByName = onlyOp ? String(o.name || "").toLowerCase().includes(onlyOp) : true;
+          return allowedByStatus && allowedByName;
+        });
+        opMap.set(job.id, filtered);
+      } catch {
+        opMap.set(job.id, []);
+      }
     }
 
-    // UID includes op id when available so Outlook doesn't dedupe different ops
-    ev.uid =
-      crypto
-        .createHash("sha1")
-        .update(`fulcrum:${ev.id}:${ev.opId || "nop"}:${ev.start}`)
-        .digest("hex") + "@bettis";
+    // build events (ONE VEVENT PER MATCHING OP)
+    const winStart = new Date(since).getTime();
+    const winEnd = new Date(until).getTime();
+    const events = [];
 
-    events.push(ev);
-  }
-}
+    for (const job of jobs) {
+      const ops = opMap.get(job.id) || [];
 
+      // If an op-name filter is set, skip jobs with no matching ops
+      if (onlyOp && ops.length === 0) continue;
+
+      for (const op of ops) {
+        // Require operation-level times for per-op feeds
+        const startIso = op?.scheduledStartUtc || op?.originalScheduledStartUtc || null;
+        let endIso = op?.scheduledEndUtc || op?.originalScheduledEndUtc || startIso;
+        if (!startIso) continue;
+
+        // window clip on op times
+        const sMs = new Date(startIso).getTime();
+        const eMs = new Date(endIso).getTime() || sMs;
+        if (eMs < winStart) continue;
+        if (sMs > winEnd) continue;
+
+        // map event with our new field layout
+        const ev = mapOpToEvent(job, op);
+        if (!ev) continue;
+
+        // allday support (exclusive DTEND)
+        if (wantAllDay) {
+          const sDate = new Date(Date.UTC(new Date(sMs).getUTCFullYear(), new Date(sMs).getUTCMonth(), new Date(sMs).getUTCDate()));
+          const eDate = new Date(Date.UTC(new Date(eMs).getUTCFullYear(), new Date(eMs).getUTCMonth(), new Date(eMs).getUTCDate() + 1));
+          ev.start = sDate.toISOString();
+          ev.end = eDate.toISOString();
+        }
+
+        // UID includes op id when available so Outlook doesn't dedupe different ops
+        const computedUid =
+          crypto
+            .createHash("sha1")
+            .update(`fulcrum:${ev.id}:${ev.opId || "nop"}:${ev.start}`)
+            .digest("hex") + "@bettis";
+
+        events.push({ ...ev, uid: computedUid });
+      }
+    }
 
     const ics =
       [
@@ -527,12 +542,9 @@ for (const job of jobs) {
         "X-WR-TIMEZONE:UTC",
         ...events.map((e) =>
           vevent({
-            // Include op id if present to avoid UID collisions across different operations
             uid:
-              crypto
-                .createHash("sha1")
-                .update(`fulcrum:${e.id}:${e.start}:${e.summary}`)
-                .digest("hex") + "@bettis",
+              e.uid ||
+              (crypto.createHash("sha1").update(`fulcrum:${e.id}:${e.start}:${e.summary}`).digest("hex") + "@bettis"),
             start: e.start,
             end: e.end,
             summary: e.summary,
@@ -559,50 +571,61 @@ for (const job of jobs) {
   }
 });
 
+async function getDiscoveredOps() {
+  const now = Date.now();
+  if (feedsCache.payload && now - feedsCache.at < FEEDS_CACHE_TTL_SECONDS * 1000) {
+    return feedsCache.payload; // { opNames, debug }
+  }
+
+  const today = new Date();
+  const addDays = (dateLike, n) => {
+    const x = new Date(dateLike);
+    x.setUTCDate(x.getUTCDate() + n);
+    return x.toISOString();
+  };
+
+  const discoverStartISO = addDays(today, -365);
+  const discoverEndISO = addDays(today, +60);
+
+  const jobsResp = await postJson(JOBS_LIST, {
+    limit: 300,
+    createdAfterUtc: discoverStartISO,
+    createdBeforeUtc: discoverEndISO,
+  });
+  const jobs = unwrapItems(jobsResp);
+
+  const setNames = new Set();
+  let scannedJobs = 0;
+  let perJobErrors = 0;
+
+  for (const j of jobs.slice(0, 200)) {
+    scannedJobs++;
+    try {
+      const opsResp = await postJson(JOB_OPS_LIST(j.id), { limit: 500 });
+      const ops = unwrapItems(opsResp).map((o) => o.operation || o);
+      for (const o of ops) {
+        if (o?.name && typeof o.name === "string") setNames.add(o.name);
+      }
+    } catch {
+      perJobErrors++;
+    }
+    if (setNames.size >= 60) break;
+  }
+
+  const opNames = Array.from(setNames);
+  const debug = { discovered: setNames.size, scannedJobs, perJobErrors };
+
+  feedsCache.at = now;
+  feedsCache.payload = { opNames, debug };
+  return feedsCache.payload;
+}
 
 /* -------------------- Pretty feeds page (SIMPLE LIST) -------------------- */
 // Requirements: list only; show name + color + hex; "Open ICS" + "Copy URL" buttons; no URL text; no tags; sorted by name.
 app.get("/feeds", async (req, res) => {
   try {
-    // Rolling created window to discover ops reliably
-    const today = new Date();
-    const isoDate = (d) => d.toISOString().slice(0, 10);
-    const addDays = (dateLike, n) => {
-      const x = new Date(dateLike);
-      x.setUTCDate(x.getUTCDate() + n);
-      return x.toISOString();
-    };
-
-    const discoverStartISO = addDays(today, -365);
-    const discoverEndISO = addDays(today, +60);
-
-    const jobsResp = await postJson(JOBS_LIST, {
-      limit: 300,
-      createdAfterUtc: discoverStartISO,
-      createdBeforeUtc: discoverEndISO,
-    });
-    const jobs = unwrapItems(jobsResp);
-
-    // Gather operation names
-    const opNames = new Set();
-    let scannedJobs = 0;
-    let perJobErrors = 0;
-
-    for (const j of jobs.slice(0, 200)) {
-      scannedJobs++;
-      try {
-        const opsResp = await postJson(JOB_OPS_LIST(j.id), { limit: 500 });
-        const ops = unwrapItems(opsResp).map((o) => o.operation || o);
-        for (const o of ops) {
-          if (o?.name && typeof o.name === "string") {
-            opNames.add(o.name);
-          }
-        }
-      } catch {
-        perJobErrors++;
-      }
-      if (opNames.size >= 60) break; // cap discovery
-    }
+    // use cached discovery (no duplicate scanning here)
+    const { opNames: discoveredNames, debug } = await getDiscoveredOps();
 
     // Suggested colors for known ops
     const colorMap = {
@@ -641,21 +664,21 @@ app.get("/feeds", async (req, res) => {
       "Office / OH / Burden",
     ];
 
+    const opNames = (discoveredNames?.length ? discoveredNames : fallbackOps)
+      .slice()
+      .sort((a,b) => a.localeCompare(b, undefined, { sensitivity:"base" }));
+
     // Rolling window for feed URLs (past 14, next 60)
-    const start = new Date(today);
-    start.setUTCDate(start.getUTCDate() - 14);
-    const end = new Date(today);
-    end.setUTCDate(end.getUTCDate() + 60);
+    const today = new Date();
+    const isoDate = (d) => d.toISOString().slice(0, 10);
+    const start = new Date(today); start.setUTCDate(start.getUTCDate() - 14);
+    const end = new Date(today);   end.setUTCDate(end.getUTCDate() + 60);
     const s = isoDate(start);
     const u = isoDate(end);
     const baseUrl = `${req.protocol}://${req.get("host")}`;
     const defaultStatuses = "scheduled,inProgress,ready,pending,paused";
 
-    const names = (opNames.size ? Array.from(opNames) : fallbackOps).sort((a, b) =>
-      a.localeCompare(b, undefined, { sensitivity: "base" })
-    );
-
-    const feeds = names.map((name) => {
+    const feeds = opNames.map((name) => {
       const only = encodeURIComponent(name);
       const url =
         `${baseUrl}/calendar-ops.ics?only=${only}` +
@@ -672,7 +695,7 @@ app.get("/feeds", async (req, res) => {
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Fulcrum Operation Feeds</title>
 <style>
-  :root { --ink:#ffffff; --muted:#a3aec0; --teal:#00848a; --bg:#0f110f; --card:#062b31; --bd:#e2e8f0; }
+  :root { --ink:#ffffff; --muted:#a3aec0; --teal:#00848a; --bg:#0f110f; --card:#062b31; --bd:#1d3a40; }
   *{box-sizing:border-box}
   body{margin:0; background:var(--bg); color:var(--ink); font-family:ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial;}
   main{max-width:900px; margin:32px auto; padding:0 16px;}
@@ -685,13 +708,13 @@ app.get("/feeds", async (req, res) => {
     background:var(--card); border:1px solid var(--bd); border-radius:12px; margin-bottom:10px;
   }
   .name{font-weight:700; flex:1 1 auto;}
-  .sw{width:25px; height:25px; border-radius:4px; border:1px solid rgba(0,0,0,0.1);}
+  .sw{width:25px; height:25px; border-radius:4px; border:1px solid rgba(0,0,0,0.25);}
   .hex{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:var(--muted); font-size:12px;}
   button{appearance:none; border:1px solid var(--bd); background:#f04923; color:#000000; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:600;}
   button.primary{background:#97999a; color:#ffffff; border:0;}
   button:active{transform:translateY(1px)}
   footer{margin-top:18px; color:var(--muted); font-size:12px;}
-  .debug{margin-top:6px; color:#64748b; font-size:12px;}
+  .debug{margin-top:6px; color:#7aa0a7; font-size:12px;}
 </style>
 </head>
 <body>
@@ -702,7 +725,7 @@ app.get("/feeds", async (req, res) => {
     <ul class="list" id="feedList"></ul>
 
     <footer>Tip: add multiple feeds to Outlook and color-code by operation.</footer>
-    <div class="debug">Discovered ops: ${opNames.size} | Jobs scanned: ${scannedJobs}${opNames.size ? "" : " | Using fallback list"}${perJobErrors ? " | Per-job errors: " + perJobErrors : ""}</div>
+    <div class="debug">Discovered ops: ${discoveredNames?.length || 0} | Jobs scanned: ${debug?.scannedJobs || 0}${discoveredNames?.length ? "" : " | Using fallback list"}${debug?.perJobErrors ? " | Per-job errors: " + debug.perJobErrors : ""}</div>
   </main>
 
 <script>
