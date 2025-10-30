@@ -171,12 +171,6 @@ function itemUrl(op) {
   return `${base}/items/${encodeURIComponent(id)}`;
 }
 
-function humanUTC(iso) {
-  const d = new Date(iso);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
-}
-
 // Replaces the old opLine
 function opLine(job, op, startIso, endIso) {
   const label = buildItemLabel(op) || (op?.id ? `Item ${op.id}` : "Item");
@@ -485,18 +479,6 @@ function humanUTC(iso) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
          `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
-}
-
-function opLine(job, op, startIso, endIso) {
-  const itemName =
-    op?.itemReference?.name ||
-    op?.itemReference?.number ||
-    op?.description || // if Fulcrum sticks item text here
-    `Op ${op?.id || ""}`.trim();
-
-  const equip = op?.scheduledEquipmentName ? ` | Equip: ${op.scheduledEquipmentName}` : "";
-  const when = `${humanUTC(startIso)} → ${humanUTC(endIso)}`;
-  return `- ${itemName} | ${when}${equip}`;
 }
 
 // /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Saw&statuses=ready,inProgress,paused,pending
