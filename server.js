@@ -652,36 +652,50 @@ app.get("/feeds.css", (req, res) => {
 });
 
 
-// ---------- Pretty feeds page (dark, buttons, copy/open) ----------
+// ---------- Pretty feeds page (dark, buttons, copy/open) with robust discovery + fallback ----------
 app.get("/feeds", async (req, res) => {
   try {
-    // small discovery sweep
-    const jobsResp = await postJson(JOBS_LIST, { limit: 150 });
-    const jobs = unwrapItems(jobsResp);
-
-    const opNames = new Set();
-    for (const j of jobs) {
-      try {
-        const opsResp = await postJson(JOB_OPS_LIST(j.id), { limit: 200 });
-        const ops = unwrapItems(opsResp).map(o => o.operation || o);
-        for (const o of ops) if (o?.name) opNames.add(o.name);
-      } catch {
-        /* ignore per-job errors */
-      }
-      if (opNames.size >= 50) break; // don't overfetch
-    }
-
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
-
-    // rolling window: past 14 days to next 60 days
+    // Rolling created window to discover ops reliably
     const today = new Date();
     const isoDate = (d) => d.toISOString().slice(0, 10);
-    const start = new Date(today); start.setUTCDate(start.getUTCDate() - 14);
-    const end   = new Date(today); end.setUTCDate(end.getUTCDate() + 60);
-    const s = isoDate(start);
-    const u = isoDate(end);
+    const addDays = (dateLike, n) => {
+      const x = new Date(dateLike);
+      x.setUTCDate(x.getUTCDate() + n);
+      return x.toISOString();
+    };
 
-    // friendly color suggestions (fallback gray if unknown)
+    const discoverStartISO = addDays(today, -365); // look back 1 year
+    const discoverEndISO   = addDays(today, +60);  // a bit ahead just in case
+
+    const jobsResp = await postJson(JOBS_LIST, {
+      limit: 300,
+      createdAfterUtc: discoverStartISO,
+      createdBeforeUtc: discoverEndISO,
+    });
+    const jobs = unwrapItems(jobsResp);
+
+    // Gather operation names from a reasonable subset
+    const opNames = new Set();
+    let scannedJobs = 0;
+    let perJobErrors = 0;
+
+    for (const j of jobs.slice(0, 200)) {
+      scannedJobs++;
+      try {
+        const opsResp = await postJson(JOB_OPS_LIST(j.id), { limit: 500 });
+        const ops = unwrapItems(opsResp).map(o => o.operation || o);
+        for (const o of ops) {
+          if (o?.name && typeof o.name === "string") {
+            opNames.add(o.name);
+          }
+        }
+      } catch {
+        perJobErrors++;
+      }
+      if (opNames.size >= 60) break; // cap discovery to keep page snappy
+    }
+
+    // Suggested colors for known ops
     const colorMap = {
       "Laser Cut": "#f59e0b",
       "Press Brake": "#3b82f6",
@@ -700,8 +714,26 @@ app.get("/feeds", async (req, res) => {
       "Office / OH / Burden": "#94a3b8"
     };
 
+    // Fallback list if discovery found nothing
+    const fallbackOps = [
+      "Laser Cut","Press Brake","Saw","Drill","Shear","Weld","Cobot Weld",
+      "Sand Blast / Clean","Paint","Packaging","Flex","OS Processing",
+      "CAD / Engineering","Trucking","Office / OH / Burden"
+    ];
+
+    // Rolling window for feed URLs (past 14, next 60)
+    const start = new Date(today); start.setUTCDate(start.getUTCDate() - 14);
+    const end   = new Date(today); end.setUTCDate(end.getUTCDate() + 60);
+    const s = isoDate(start);
+    const u = isoDate(end);
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
     const defaultStatuses = "scheduled,inProgress,ready,pending,paused";
-    const feeds = Array.from(opNames).sort().map(name => {
+
+    const names = opNames.size ? Array.from(opNames).sort()
+                               : fallbackOps;
+
+    const feeds = names.map(name => {
       const only = encodeURIComponent(name);
       const url =
         `${baseUrl}/calendar-ops.ics?only=${only}` +
@@ -713,6 +745,7 @@ app.get("/feeds", async (req, res) => {
       };
     });
 
+    // Render page
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(`<!doctype html>
 <html lang="en">
@@ -721,45 +754,46 @@ app.get("/feeds", async (req, res) => {
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Fulcrum Operation Feeds</title>
 <style>
-  :root{
-    --bg:#0b1220; --panel:#111827; --muted:#9ca3af; --fg:#e5e7eb; --accent:#38bdf8; --card:#0f172a; --chip:#1f2937;
-  }
+  :root{ --bg:#0b1220; --panel:#111827; --muted:#9ca3af; --fg:#e5e7eb; --accent:#38bdf8; --card:#0f172a; --chip:#1f2937; }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial}
   header{max-width:1100px;margin:32px auto 0;padding:0 16px}
   h1{margin:0 0 4px 0;font-size:28px;font-weight:700}
-  p.sub{margin:0;color:var(--muted)}
-  .panel{max-width:1100px;margin:24px auto;padding:16px}
+  p.sub{margin:0 0 12px;color:var(--muted)}
+  .panel{max-width:1100px;margin:16px auto;padding:0 16px}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
   .card{background:var(--card);border:1px solid #1f2937;border-radius:14px;padding:14px;box-shadow:0 10px 18px rgba(0,0,0,.25)}
   .name{display:flex;align-items:center;gap:10px;margin-bottom:10px}
   .swatch{width:14px;height:14px;border-radius:3px;border:1px solid rgba(255,255,255,.25);flex:0 0 auto}
   .url{font-size:12px;color:var(--muted);word-break:break-all;margin:8px 0 12px}
-  .btnrow{display:flex;gap:8px}
+  .btnrow{display:flex;gap:8px;flex-wrap:wrap}
   button{appearance:none;border:1px solid #334155;background:#0b1220;color:var(--fg);padding:8px 10px;border-radius:10px;cursor:pointer}
   button.primary{background:var(--accent);color:#001018;border:none}
   button:active{transform:translateY(1px)}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
   .chip{background:var(--chip);color:var(--muted);border-radius:999px;padding:4px 10px;font-size:12px;border:1px solid #374151}
   footer{max-width:1100px;margin:18px auto 40px;color:var(--muted);font-size:12px;padding:0 16px}
+  .debug{margin-top:8px;font-size:12px;color:#9ca3af}
 </style>
 </head>
 <body>
   <header>
     <h1>Fulcrum Operation Feeds</h1>
-    <p class="sub">Copy or open an ICS feed for a specific operation. These links use a rolling window (past 14 days → next 60).</p>
+    <p class="sub">Copy or open an ICS feed for a specific operation. Links use a rolling window (past 14 → next 60 days).</p>
   </header>
   <section class="panel">
     <div id="grid" class="grid"></div>
+    <div class="debug">
+      Discovered ops: ${opNames.size} | Jobs scanned: ${scannedJobs}${opNames.size ? "" : " | Using fallback list"}
+      ${perJobErrors ? " | Per-job errors: " + perJobErrors : ""}
+    </div>
   </section>
   <footer>
-    Tip: Add multiple feeds to Outlook and color-code each one. Rolling dates prevent feeds from going stale.
+    Tip: Add multiple feeds to Outlook and color-code each one. Rolling dates prevent stale calendars.
   </footer>
 
 <script>
-  // server-embedded data
   const feeds = ${JSON.stringify(feeds)};
-
   const grid = document.getElementById("grid");
 
   function card(feed){
@@ -797,7 +831,6 @@ app.get("/feeds", async (req, res) => {
         copyBtn.textContent = "Copied!";
         setTimeout(() => (copyBtn.textContent = "Copy URL"), 1200);
       } catch {
-        // fallback
         const ta = document.createElement("textarea");
         ta.value = feed.url;
         document.body.appendChild(ta);
@@ -834,6 +867,7 @@ app.get("/feeds", async (req, res) => {
     res.status(500).send(`Error: ${err.message}`);
   }
 });
+
 
 
 /* -------------------- test -------------------- */
