@@ -633,7 +633,7 @@ app.get("/feeds", async (req, res) => {
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Fulcrum Operation Feeds</title>
 <style>
-  :root { --ink:#0f172a; --muted:#475569; --teal:#004c50; --bg:#f8fafc; --card:#ffffff; --bd:#e2e8f0; }
+  :root { --ink:#0f172a; --muted:#475569; --teal:#004c50; --bg:#062b31; --card:#212721; --bd:#e2e8f0; }
   *{box-sizing:border-box}
   body{margin:0; background:var(--bg); color:var(--ink); font-family:ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial;}
   main{max-width:900px; margin:32px auto; padding:0 16px;}
@@ -649,7 +649,7 @@ app.get("/feeds", async (req, res) => {
   .sw{width:16px; height:16px; border-radius:4px; border:1px solid rgba(0,0,0,0.1);}
   .hex{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:var(--muted); font-size:12px;}
   button{appearance:none; border:1px solid var(--bd); background:#eef2f7; color:#0f172a; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:600;}
-  button.primary{background:#11b0bd; color:#001317; border:0;}
+  button.primary{background:#f04923; color:#001317; border:0;}
   button:active{transform:translateY(1px)}
   footer{margin-top:18px; color:var(--muted); font-size:12px;}
   .debug{margin-top:6px; color:#64748b; font-size:12px;}
