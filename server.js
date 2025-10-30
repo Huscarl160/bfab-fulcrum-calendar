@@ -143,7 +143,7 @@ function addDaysISO(isoDate, days) {
 
 // Extract an F-style project code like "F251289-1"
 function getProjectCode(job) {
-  // Try likely fields in order
+  // Candidate fields to inspect (stringified, filtered)
   const candidates = [
     job?.projectNumber,
     job?.jobNumber,
@@ -151,26 +151,31 @@ function getProjectCode(job) {
     job?.numberString,
     job?.salesOrderId,
     job?.orderNumber,
-    job?.number, // may be non-F or numeric, we'll validate below
+    job?.number, // may be numeric; we'll validate
     job?.customFields?.projectNumber,
+    job?.name,   // sometimes embedded in the name
   ].filter(Boolean).map(String);
 
-  // Include any F-code embedded in the job name
-  if (job?.name) candidates.push(String(job.name));
-
-  // Look for F + YY + XXXX (with optional -suffix), case-insensitive
-  const rxStrict = /^F\d{2}\d{4}(?:-\d+)?$/i;
-  const rxLoose  = /(F\d{2}\d{4}(?:-\d+)?)/i;
+  // Patterns:
+  // - strict: whole string is an F-code
+  // - loose: F-code appears anywhere inside
+  const rxStrict = /^F\d{6}(?:-\d+)?$/i;       // F + 6 digits, optional -suffix
+  const rxLoose  = /(F\d{6}(?:-\d+)?)/i;
 
   for (const c of candidates) {
-    const m = c.match(rxStrict) || c.match(rxLoose);
-    if (m) return m[1].toUpperCase();
+    const mStrict = c.match(rxStrict);
+    if (mStrict) return mStrict[0].toUpperCase();   // use full match
+
+    const mLoose = c.match(rxLoose);
+    if (mLoose) return mLoose[1].toUpperCase();     // use captured group
   }
 
-  // Last resort: keep original non-numeric number, else synthesize something stable
-  if (job?.number && isNaN(Number(job.number))) return String(job.number);
-  return `F??${String(job?.id ?? "").slice(-4) || "0000"}`;
+  // Last resort: if job.number is non-numeric, keep it; otherwise synthesize something stable
+  if (job?.number && isNaN(Number(job.number))) return String(job.number).toUpperCase();
+  const tail = String(job?.id ?? "").slice(-4) || "0000";
+  return `F??${tail}`.toUpperCase();
 }
+
 
 // Try hard to extract a clean client/customer label from the job
 function getClientName(job) {
@@ -648,8 +653,6 @@ app.get("/calendar-ops.ics", async (req, res) => {
       const code = getProjectCode(job);
       const countSuffix = ops.length > 1 ? ` (${ops.length} items)` : "";
       const summary = `${code} - ${opName}${countSuffix}`;
-      
-      
 
       const clientName = getClientName(job);
 
