@@ -19,7 +19,13 @@ const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
 const FEEDS_CACHE_TTL_SECONDS = Number(process.env.FEEDS_CACHE_TTL_SECONDS || 900); // 15 min
 const feedsCache = { at: 0, payload: null };
-const FULCRUM_UI_BASE = process.env.FULCRUM_UI_BASE || "https://bettis.fulcrumpro.com/ui/items";
+
+// How to build item URLs: "number" (default) or "id"
+// If your tenant needs the internal id, set ITEM_URL_MODE=id in Render env.
+const ITEM_URL_MODE = (process.env.ITEM_URL_MODE || "number").toLowerCase();
+
+// Exact items UI root for your tenant
+const FULCRUM_UI_BASE = (process.env.FULCRUM_UI_BASE || "https://bettis.fulcrumpro.com/ui/items").replace(/\/+$/, "");
 
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
@@ -148,29 +154,39 @@ function getClientName(job) {
   );
 }
 
-// Build: "<number> <name>, <description>" with lots of fallbacks
+// "<number> <name>, <description>" with robust fallbacks
 function buildItemLabel(op) {
   const r = op?.itemReference || {};
-  const name   = r.name || r.itemName || op?.name || "";
+  const number = r.number || r.itemNumber || r.code || r.sku || "";
+  const name   = r.name   || r.itemName   || op?.name || "";
   const desc   = r.description || r.itemDescription || op?.description || "";
 
-  const left  = [name].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const left  = [number, name].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
   const right = [desc].filter(Boolean).join(", ").replace(/\s+/g, " ").trim();
 
-  return right ? `${left} ${left ? "" : ""}${right ? `, ${right}` : ""}`.trim() : left || (op?.id ? `Item ${op.id}` : "Item");
+  return right ? `${left}${left ? "" : ""}${right ? (left ? `, ${right}` : right) : ""}`.trim()
+               : (left || (op?.id ? `Item ${op.id}` : "Item"));
 }
 
-// Build https://bettis.fulcrumpro.com/ui/items/<id>
+// Build a usable URL to the item.
+// Priority:
+//   - If ITEM_URL_MODE=number and we have a number: /ui/items/<number>
+//   - Else if we have an internal id:               /ui/items/<id>
+//   - Else:                                         /ui/items?query=<best label>
+// Also append a fallback search URL if mode=id fails in your tenant.
 function itemUrl(op) {
-  if (!FULCRUM_UI_BASE) return null;
-  const base = String(FULCRUM_UI_BASE).replace(/\/+$/, ""); // no trailing slash
-  const id =
-    op?.itemReference?.id ||
-    op?.itemReferenceId ||
-    op?.itemId ||
-    op?.id ||
-    null;
-  return id ? `${base}/${encodeURIComponent(id)}` : null;
+  const r = op?.itemReference || {};
+  const number = r.number || r.itemNumber || r.code || r.sku || "";
+  const internalId = r.id || op?.itemReferenceId || op?.itemId || op?.id || "";
+
+  // Primary link by configured mode
+  if (ITEM_URL_MODE === "number" && number) return `${FULCRUM_UI_BASE}/${encodeURIComponent(number)}`;
+  if (internalId) return `${FULCRUM_UI_BASE}/${encodeURIComponent(internalId)}`;
+  if (number) return `${FULCRUM_UI_BASE}/${encodeURIComponent(number)}`;
+
+  // Last-ditch: a search URL
+  const q = buildItemLabel(op);
+  return `${FULCRUM_UI_BASE}?query=${encodeURIComponent(q)}`;
 }
 
 // One line per item inside the aggregated DESCRIPTION
@@ -434,9 +450,7 @@ function mapOpToEvent(job, op) {
 
   if (!start) return null;
 
-  const jobNum = job.number != null ? `#${job.number}` : "";
   const jobTitle = job.name || "Untitled Job";
-  const opName = op?.name || "Operation";
   const equip = op?.scheduledEquipmentName || "";
 
   const summary = [opName, "—", jobNum ? `${jobNum}:` : "", jobTitle]
@@ -478,7 +492,7 @@ function mapOpToEvent(job, op) {
 function humanUTC(iso) {
   const d = new Date(iso);
   const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
 }
 
 // /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Saw&statuses=ready,inProgress,paused,pending
@@ -600,9 +614,9 @@ app.get("/calendar-ops.ics", async (req, res) => {
       const jobTitle = job.name || "Untitled Job";
       const itemCount = ops.length;
 
-      const summary = [
-        opName, "—", jobNum ? `${jobNum}:` : "", jobTitle, itemCount > 1 ? `(${itemCount} items)` : ""
-      ].filter(Boolean).join(" ").replace(/\s+/g, " ");
+      const countSuffix = ops.length > 1 ? ` (${ops.length} items)` : "";
+      const summary = `${job.number || job.id} - ${opName}${countSuffix}`;
+      
 
       const clientName = getClientName(job);
 
