@@ -807,6 +807,7 @@ app.get("/feeds", async (req, res) => {
     const sw = document.createElement("span");
     sw.className = "sw";
     sw.style.background = feed.color;
+    sw.title = feed.color; // hover shows the hex
 
     const name = document.createElement("span");
     name.className = "name";
@@ -817,13 +818,13 @@ app.get("/feeds", async (req, res) => {
     openBtn.textContent = "Open ICS";
     openBtn.onclick = () => window.open(feed.url, "_blank", "noopener,noreferrer");
 
-    const copyBtn = document.createElement("button");
-    copyBtn.textContent = "Copy URL";
-    copyBtn.onclick = async () => {
+    const copyUrlBtn = document.createElement("button");
+    copyUrlBtn.textContent = "Copy URL";
+    copyUrlBtn.onclick = async () => {
       try {
         await navigator.clipboard.writeText(feed.url);
-        copyBtn.textContent = "Copied!";
-        setTimeout(() => (copyBtn.textContent = "Copy URL"), 1200);
+        copyUrlBtn.textContent = "Copied!";
+        setTimeout(() => (copyUrlBtn.textContent = "Copy URL"), 1200);
       } catch {
         const ta = document.createElement("textarea");
         ta.value = feed.url;
@@ -831,15 +832,36 @@ app.get("/feeds", async (req, res) => {
         ta.select();
         document.execCommand("copy");
         document.body.removeChild(ta);
-        copyBtn.textContent = "Copied!";
-        setTimeout(() => (copyBtn.textContent = "Copy URL"), 1200);
+        copyUrlBtn.textContent = "Copied!";
+        setTimeout(() => (copyUrlBtn.textContent = "Copy URL"), 1200);
+      }
+    };
+
+    const copyHexBtn = document.createElement("button");
+    copyHexBtn.textContent = "Copy Hex";
+    copyHexBtn.title = "Copy " + feed.color;
+    copyHexBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(feed.color);
+        copyHexBtn.textContent = "Copied!";
+        setTimeout(() => (copyHexBtn.textContent = "Copy Hex"), 1200);
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = feed.color;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        copyHexBtn.textContent = "Copied!";
+        setTimeout(() => (copyHexBtn.textContent = "Copy Hex"), 1200);
       }
     };
 
     li.appendChild(sw);
     li.appendChild(name);
     li.appendChild(openBtn);
-    li.appendChild(copyBtn);
+    li.appendChild(copyUrlBtn);
+    li.appendChild(copyHexBtn);
     return li;
   }
 
