@@ -412,18 +412,42 @@ function humanShortUTC(iso) {
   )}`;
 }
 
-// "<number> (<name[, desc]>)" with fallbacks
-function buildItemLabelPretty(op) {
-  const r = op?.itemReference || {};
-  const number = r.number || r.itemNumber || r.code || r.sku || "";
-  const name = r.name || r.itemName || "";
-  const desc = r.description || r.itemDescription || "";
-  const paren = [name, desc].filter(Boolean).join(", ");
-  if (number && paren) return `${number} (${paren})`;
-  if (number) return number;
-  if (paren) return `(${paren})`;
-  return op?.name || op?.description || (op?.id ? `Item ${op.id}` : "Item");
+// Try hard to extract item name/description from common Fulcrum shapes
+function extractItemFields(op) {
+  const ref = op?.itemReference || op?.item || op?.itemRef || {};
+  const number =
+    ref.number || ref.itemNumber || ref.code || ref.sku ||
+    op?.itemNumber || op?.number || op?.code || op?.sku || "";
+
+  // Prefer explicit itemName/description if present; fall back to op fields
+  const name =
+    ref.name || op?.itemName || op?.name || "";           // "Item Name"
+  const desc =
+    ref.description || op?.itemDescription || op?.description || ""; // "Item Description"
+
+  return { number: String(number || ""), name: String(name || ""), desc: String(desc || "") };
 }
+
+// Build "Item Name (Item Description)" with sensible fallbacks
+function buildItemLabelPretty(op) {
+  const { number, name, desc } = extractItemFields(op);
+
+  // Requested format: "Item Name (Item Description)"
+  if (name && desc) return `${name} (${desc})`;
+  if (name) return name;
+
+  // If no name, fall back to number (and include desc if present)
+  if (number && desc) return `${number} (${desc})`;
+  if (number) return number;
+
+  // Absolute last ditch: op name/description or generic
+  if (op?.name && op?.description) return `${op.name} (${op.description})`;
+  if (op?.name) return op.name;
+  if (op?.description) return op.description;
+
+  return op?.id ? `Item ${op.id}` : "Item";
+}
+
 
 // Try to extract a clean client/customer label
 function getClientName(job) {
@@ -438,7 +462,7 @@ function getClientName(job) {
   );
 }
 
-// One line per item inside the aggregated DESCRIPTION (no URL for now)
+/// Result: "- Item Name (Item Description) | 10-31-2025, 12:36 → 11-10-2025, 23:31 | BSW003 - Vertical Band Saw"
 function opLine(job, op, startIso, endIso) {
   const label = buildItemLabelPretty(op);
   const when = `${humanShortUTC(startIso)} → ${humanShortUTC(endIso)}`;
@@ -843,33 +867,32 @@ app.get("/feeds", async (req, res) => {
 
             const copyHexBtn = document.createElement("button");
             copyHexBtn.textContent = "Copy Hex";
-            copyHexBtn.title = "Copy " + feed.color;
 
-            // Apply background = feed.color, text color auto-adjusted for contrast
+            // keep background as the real hex (with #)
             copyHexBtn.style.background = feed.color;
 
-            // Function to decide text color (white for dark colors, black for light)
-            function luminance(hex) {
-              const c = hex.replace("#", "");
-              if (c.length !== 6) return 0; // fallback
-              const r = parseInt(c.slice(0, 2), 16);
-              const g = parseInt(c.slice(2, 4), 16);
-              const b = parseInt(c.slice(4, 6), 16);
-              return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-            }
-            const lum = luminance(feed.color);
-            copyHexBtn.style.color = lum < 0.5 ? "#ffffff" : "#000000";
-            copyHexBtn.style.border = "1px solid rgba(0,0,0,0.25)";
+            // pick readable text color
+            (function () {
+              const c = (feed.color || "").replace("#", "");
+              const r = parseInt(c.slice(0, 2), 16) || 0;
+              const g = parseInt(c.slice(2, 4), 16) || 0;
+              const b = parseInt(c.slice(4, 6), 16) || 0;
+              const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+              copyHexBtn.style.color = luminance < 0.5 ? "#ffffff" : "#000000";
+            })();
+
+            copyHexBtn.title = "Copy " + feed.color; // shows the full hex on hover
 
             copyHexBtn.onclick = async () => {
+              const naked = String(feed.color || "").replace(/^#/, ""); // <-- strip the '#'
               try {
-                await navigator.clipboard.writeText(feed.color);
+                await navigator.clipboard.writeText(naked);
                 const original = copyHexBtn.textContent;
                 copyHexBtn.textContent = "Copied!";
                 setTimeout(() => (copyHexBtn.textContent = original), 1200);
               } catch {
                 const ta = document.createElement("textarea");
-                ta.value = feed.color;
+                ta.value = naked;
                 document.body.appendChild(ta);
                 ta.select();
                 document.execCommand("copy");
@@ -878,7 +901,6 @@ app.get("/feeds", async (req, res) => {
                 setTimeout(() => (copyHexBtn.textContent = "Copy Hex"), 1200);
               }
             };
-
 
             li.appendChild(sw);
             li.appendChild(name);
