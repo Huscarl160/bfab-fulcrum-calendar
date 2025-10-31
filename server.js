@@ -691,9 +691,23 @@ async function getDiscoveredOps() {
 }
 
 /* -------------------- Pretty feeds page (simple list) -------------------- */
+/* -------------------- Pretty feeds page (simple list with graceful fallback) -------------------- */
 app.get("/feeds", async (req, res) => {
   try {
-    const { opNames: discoveredNames, debug } = await getDiscoveredOps();
+    let discoveredNames = null;
+    let debug = { discovered: 0, scannedJobs: 0, perJobErrors: 0 };
+    let apiStatus = "ok"; // "ok" | "unauthorized" | "error"
+    let apiErrorMsg = "";
+
+    try {
+      const payload = await getDiscoveredOps();
+      discoveredNames = payload?.opNames || [];
+      debug = payload?.debug || debug;
+    } catch (err) {
+      apiErrorMsg = String(err?.message || err || "Unknown error");
+      apiStatus = /(^|\s)(401|403)(\s|$)/.test(apiErrorMsg) ? "unauthorized" : "error";
+      // fall through to fallback list
+    }
 
     const colorMap = {
       "Laser Cut": "#f59e0b",
@@ -714,21 +728,9 @@ app.get("/feeds", async (req, res) => {
     };
 
     const fallbackOps = [
-      "Laser Cut",
-      "Press Brake",
-      "Saw",
-      "Drill",
-      "Shear",
-      "Weld",
-      "Cobot Weld",
-      "Sand Blast / Clean",
-      "Paint",
-      "Packaging",
-      "Flex",
-      "OS Processing",
-      "CAD / Engineering",
-      "Trucking",
-      "Office / OH / Burden",
+      "Laser Cut","Press Brake","Saw","Drill","Shear","Weld","Cobot Weld",
+      "Sand Blast / Clean","Paint","Packaging","Flex","OS Processing",
+      "CAD / Engineering","Trucking","Office / OH / Burden",
     ];
 
     const opNames = (discoveredNames?.length ? discoveredNames : fallbackOps)
@@ -737,12 +739,9 @@ app.get("/feeds", async (req, res) => {
 
     const today = new Date();
     const isoDate = (d) => d.toISOString().slice(0, 10);
-    const start = new Date(today);
-    start.setUTCDate(start.getUTCDate() - 14);
-    const end = new Date(today);
-    end.setUTCDate(end.getUTCDate() + 60);
-    const s = isoDate(start);
-    const u = isoDate(end);
+    const start = new Date(today); start.setUTCDate(start.getUTCDate() - 14);
+    const end   = new Date(today); end.setUTCDate(end.getUTCDate() + 60);
+    const s = isoDate(start), u = isoDate(end);
     const baseUrl = `${req.protocol}://${req.get("host")}`;
     const defaultStatuses = "scheduled,inProgress,ready,pending,paused";
 
@@ -754,123 +753,149 @@ app.get("/feeds", async (req, res) => {
       return { name, url, color: colorMap[name] || "#6b7280" };
     });
 
+    // Render page (always 200 OK, even if Fulcrum is down/unauthorized)
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Fulcrum Operation Feeds</title>
-<style>
-  :root { --ink:#ffffff; --muted:#a3aec0; --teal:#00848a; --bg:#0f110f; --card:#062b31; --bd:#1d3a40; }
-  *{box-sizing:border-box}
-  body{margin:0; background:var(--bg); color:var(--ink); font-family:ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial;}
-  main{max-width:900px; margin:32px auto; padding:0 16px;}
-  h1{margin:0 0 6px; color:var(--teal); font-size:28px; font-weight:800;}
-  p.sub{margin:0 0 16px; color:var(--muted);}
+        <html lang="en">
+        <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width,initial-scale=1"/>
+        <title>Fulcrum Operation Feeds</title>
+        <style>
+          :root { --ink:#ffffff; --muted:#a3aec0; --teal:#00848a; --bg:#0f110f; --card:#062b31; --bd:#1d3a40; --warn:#5b1b1b; --warnbd:#b91c1c; }
+          *{box-sizing:border-box}
+          body{margin:0; background:var(--bg); color:var(--ink); font-family:ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial;}
+          main{max-width:900px; margin:32px auto; padding:0 16px;}
+          h1{margin:0 0 6px; color:var(--teal); font-size:28px; font-weight:800;}
+          p.sub{margin:0 0 16px; color:var(--muted);}
+          .banner{display:${apiStatus==="ok"?"none":"block"}; background:var(--warn); border:1px solid var(--warnbd); color:#ffdada; padding:10px 12px; border-radius:10px; margin:10px 0 14px;}
+          .banner .small{opacity:.9; font-size:.85rem}
+          ul.list{list-style:none; padding:0; margin:16px 0 0;}
+          li.row{
+            display:flex; align-items:center; gap:12px; padding:12px 14px;
+            background:var(--card); border:1px solid var(--bd); border-radius:12px; margin-bottom:10px;
+          }
+          .name{font-weight:700; flex:1 1 auto;}
+          .sw{width:25px; height:25px; border-radius:4px; border:1px solid rgba(0,0,0,0.25);}
+          button{appearance:none; border:1px solid var(--bd); background:#f04923; color:#000; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:600;}
+          button.primary{background:#97999a; color:#fff; border:0;}
+          button:active{transform:translateY(1px)}
+          footer{margin-top:18px; color:var(--muted); font-size:12px;}
+          .debug{margin-top:6px; color:#7aa0a7; font-size:12px;}
+        </style>
+        </head>
+        <body>
+          <main>
+            <h1>Fulcrum Operation Feeds</h1>
+            <p class="sub">Each feed is an ICS for a specific operation (rolling: past 14 → next 60 days).</p>
 
-  ul.list{list-style:none; padding:0; margin:16px 0 0;}
-  li.row{
-    display:flex; align-items:center; gap:12px; padding:12px 14px;
-    background:var(--card); border:1px solid var(--bd); border-radius:12px; margin-bottom:10px;
-  }
-  .name{font-weight:700; flex:1 1 auto;}
-  .sw{width:25px; height:25px; border-radius:4px; border:1px solid rgba(0,0,0,0.25);}
-  .hex{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:var(--muted); font-size:12px;}
-  button{appearance:none; border:1px solid var(--bd); background:#f04923; color:#000000; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:600;}
-  button.primary{background:#97999a; color:#ffffff; border:0;}
-  button:active{transform:translateY(1px)}
-  footer{margin-top:18px; color:var(--muted); font-size:12px;}
-  .debug{margin-top:6px; color:#7aa0a7; font-size:12px;}
-</style>
-</head>
-<body>
-  <main>
-    <h1>Fulcrum Operation Feeds</h1>
-    <p class="sub">Each feed is an ICS for a specific operation (rolling: past 14 → next 60 days).</p>
+            <div class="banner">
+              <div><strong>${apiStatus==="unauthorized" ? "Fulcrum authorization failed" : "Fulcrum API unavailable"}</strong></div>
+              <div class="small">Showing fallback operation list. ${apiErrorMsg ? ("(" + apiErrorMsg.replace(/</g,"&lt;") + ")") : ""}</div>
+            </div>
 
-    <ul class="list" id="feedList"></ul>
+            <ul class="list" id="feedList"></ul>
 
-    <footer>Tip: add multiple feeds to Outlook and color-code by operation.</footer>
-    <div class="debug">Discovered ops: ${discoveredNames?.length || 0} | Jobs scanned: ${debug?.scannedJobs || 0}${discoveredNames?.length ? "" : " | Using fallback list"}${debug?.perJobErrors ? " | Per-job errors: " + debug.perJobErrors : ""}</div>
-  </main>
+            <footer>Tip: add multiple feeds to Outlook and color-code by operation.</footer>
+            <div class="debug">Discovered ops: ${discoveredNames?.length || 0} | Jobs scanned: ${debug?.scannedJobs || 0}${discoveredNames?.length ? "" : " | Using fallback list"}${debug?.perJobErrors ? " | Per-job errors: " + debug.perJobErrors : ""}</div>
+          </main>
 
-<script>
-  const feeds = ${JSON.stringify(feeds)};
+        <script>
+          const feeds = ${JSON.stringify(feeds)};
+          const list = document.getElementById("feedList");
 
-  const list = document.getElementById("feedList");
+          function row(feed){
+            const li = document.createElement("li");
+            li.className = "row";
 
-  function row(feed){
-    const li = document.createElement("li");
-    li.className = "row";
+            const sw = document.createElement("span");
+            sw.className = "sw";
+            sw.style.background = feed.color;
+            sw.title = feed.color;
 
-    const sw = document.createElement("span");
-    sw.className = "sw";
-    sw.style.background = feed.color;
-    sw.title = feed.color; // hover shows the hex
+            const name = document.createElement("span");
+            name.className = "name";
+            name.textContent = feed.name;
 
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = feed.name;
+            const openBtn = document.createElement("button");
+            openBtn.className = "primary";
+            openBtn.textContent = "Open ICS";
+            openBtn.onclick = () => window.open(feed.url, "_blank", "noopener,noreferrer");
 
-    const openBtn = document.createElement("button");
-    openBtn.className = "primary";
-    openBtn.textContent = "Open ICS";
-    openBtn.onclick = () => window.open(feed.url, "_blank", "noopener,noreferrer");
+            const copyUrlBtn = document.createElement("button");
+            copyUrlBtn.textContent = "Copy URL";
+            copyUrlBtn.onclick = async () => {
+              try {
+                await navigator.clipboard.writeText(feed.url);
+                copyUrlBtn.textContent = "Copied!";
+                setTimeout(() => (copyUrlBtn.textContent = "Copy URL"), 1200);
+              } catch {
+                const ta = document.createElement("textarea");
+                ta.value = feed.url;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+                copyUrlBtn.textContent = "Copied!";
+                setTimeout(() => (copyUrlBtn.textContent = "Copy URL"), 1200);
+              }
+            };
 
-    const copyUrlBtn = document.createElement("button");
-    copyUrlBtn.textContent = "Copy URL";
-    copyUrlBtn.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(feed.url);
-        copyUrlBtn.textContent = "Copied!";
-        setTimeout(() => (copyUrlBtn.textContent = "Copy URL"), 1200);
-      } catch {
-        const ta = document.createElement("textarea");
-        ta.value = feed.url;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-        copyUrlBtn.textContent = "Copied!";
-        setTimeout(() => (copyUrlBtn.textContent = "Copy URL"), 1200);
-      }
-    };
+            const copyHexBtn = document.createElement("button");
+            copyHexBtn.textContent = "Copy Hex";
+            copyHexBtn.title = "Copy " + feed.color;
 
-    const copyHexBtn = document.createElement("button");
-    copyHexBtn.textContent = "Copy Hex";
-    copyHexBtn.title = "Copy " + feed.color;
-    copyHexBtn.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(feed.color);
-        copyHexBtn.textContent = "Copied!";
-        setTimeout(() => (copyHexBtn.textContent = "Copy Hex"), 1200);
-      } catch {
-        const ta = document.createElement("textarea");
-        ta.value = feed.color;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-        copyHexBtn.textContent = "Copied!";
-        setTimeout(() => (copyHexBtn.textContent = "Copy Hex"), 1200);
-      }
-    };
+            // Apply background = feed.color, text color auto-adjusted for contrast
+            copyHexBtn.style.background = feed.color;
 
-    li.appendChild(sw);
-    li.appendChild(name);
-    li.appendChild(openBtn);
-    li.appendChild(copyUrlBtn);
-    li.appendChild(copyHexBtn);
-    return li;
-  }
+            // Function to decide text color (white for dark colors, black for light)
+            function luminance(hex) {
+              const c = hex.replace("#", "");
+              if (c.length !== 6) return 0; // fallback
+              const r = parseInt(c.slice(0, 2), 16);
+              const g = parseInt(c.slice(2, 4), 16);
+              const b = parseInt(c.slice(4, 6), 16);
+              return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+            }
+            const lum = luminance(feed.color);
+            copyHexBtn.style.color = lum < 0.5 ? "#ffffff" : "#000000";
+            copyHexBtn.style.border = "1px solid rgba(0,0,0,0.25)";
 
-  feeds.forEach(f => list.appendChild(row(f)));
-</script>
-</body>
-</html>`);
+            copyHexBtn.onclick = async () => {
+              try {
+                await navigator.clipboard.writeText(feed.color);
+                const original = copyHexBtn.textContent;
+                copyHexBtn.textContent = "Copied!";
+                setTimeout(() => (copyHexBtn.textContent = original), 1200);
+              } catch {
+                const ta = document.createElement("textarea");
+                ta.value = feed.color;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+                copyHexBtn.textContent = "Copied!";
+                setTimeout(() => (copyHexBtn.textContent = "Copy Hex"), 1200);
+              }
+            };
+
+
+            li.appendChild(sw);
+            li.appendChild(name);
+            li.appendChild(openBtn);
+            li.appendChild(copyUrlBtn);
+            li.appendChild(copyHexBtn);
+            return li;
+          }
+
+          feeds.forEach(f => list.appendChild(row(f)));
+        </script>
+        </body>
+        </html>`);
   } catch (err) {
-    res.status(500).send(`Error: ${err.message}`);
+    // As a last resort, send a minimal page rather than a 500
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.status(200).send(`<pre>Feeds temporarily unavailable.\n${String(err?.message || err)}</pre>`);
   }
 });
 
@@ -901,6 +926,15 @@ app.get("/test.ics", (req, res) => {
   res.setHeader("Content-Type", "text/calendar; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
   res.status(200).send(ics);
+});
+
+// Simple favicon (teal circle on transparent)
+app.get("/favicon.ico", (req, res) => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">
+    <circle cx="32" cy="32" r="28" fill="#00848a"/>
+  </svg>`;
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.status(200).send(svg);
 });
 
 /* -------------------- start -------------------- */
