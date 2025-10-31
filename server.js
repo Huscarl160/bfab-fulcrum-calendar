@@ -959,6 +959,23 @@ app.get("/favicon.ico", (req, res) => {
   res.status(200).send(svg);
 });
 
+// --- TEMPORARY DEBUG ROUTE (remove after use) ---
+app.get("/debug/sample-op", async (req, res) => {
+  try {
+    const jobsResp = await postJson(JOBS_LIST, { limit: 1 }); // just grab one
+    const jobs = unwrapItems(jobsResp);
+    if (!jobs.length) return res.status(404).send("No jobs found");
+
+    const job = jobs[0];
+    const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 5 });
+    const ops = unwrapItems(opsResp).map(o => o.operation || o);
+
+    res.json({ job, ops });
+  } catch (err) {
+    res.status(500).send(`Error: ${err.message}`);
+  }
+});
+
 /* -------------------- start -------------------- */
 app.listen(PORT, () => {
   console.log(`ICS feed running on :${PORT}`);
