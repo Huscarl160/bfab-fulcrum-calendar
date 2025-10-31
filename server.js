@@ -6,6 +6,7 @@
 //   ACCESS_KEY (optional) require ?key=...
 //   CACHE_TTL_SECONDS (default: 60)
 //   CREATED_WINDOW_BUFFER_DAYS (default: 180)
+//   FEEDS_CACHE_TTL_SECONDS (default: 900)
 
 import express from "express";
 import crypto from "crypto";
@@ -19,13 +20,6 @@ const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60);
 const CREATED_WINDOW_BUFFER_DAYS = Number(process.env.CREATED_WINDOW_BUFFER_DAYS || 180);
 const FEEDS_CACHE_TTL_SECONDS = Number(process.env.FEEDS_CACHE_TTL_SECONDS || 900); // 15 min
 const feedsCache = { at: 0, payload: null };
-
-// How to build item URLs: "number" (default) or "id"
-// If your tenant needs the internal id, set ITEM_URL_MODE=id in Render env.
-const ITEM_URL_MODE = (process.env.ITEM_URL_MODE || "number").toLowerCase();
-
-// Exact items UI root for your tenant
-const FULCRUM_UI_BASE = (process.env.FULCRUM_UI_BASE || "https://bettis.fulcrumpro.com/ui/items").replace(/\/+$/, "");
 
 if (!TOKEN) {
   console.error("Missing FULCRUM_TOKEN env var. Exiting.");
@@ -141,102 +135,7 @@ function addDaysISO(isoDate, days) {
   return d.toISOString();
 }
 
-// Extract an F-style project code like "F251289-1"
-function getProjectCode(job) {
-  // Candidate fields to inspect (stringified, filtered)
-  const candidates = [
-    job?.projectNumber,
-    job?.jobNumber,
-    job?.numberFormatted,
-    job?.numberString,
-    job?.salesOrderId,
-    job?.orderNumber,
-    job?.number, // may be numeric; we'll validate
-    job?.customFields?.projectNumber,
-    job?.name,   // sometimes embedded in the name
-  ].filter(Boolean).map(String);
-
-  // Patterns:
-  // - strict: whole string is an F-code
-  // - loose: F-code appears anywhere inside
-  const rxStrict = /^F\d{6}(?:-\d+)?$/i;       // F + 6 digits, optional -suffix
-  const rxLoose  = /(F\d{6}(?:-\d+)?)/i;
-
-  for (const c of candidates) {
-    const mStrict = c.match(rxStrict);
-    if (mStrict) return mStrict[0].toUpperCase();   // use full match
-
-    const mLoose = c.match(rxLoose);
-    if (mLoose) return mLoose[1].toUpperCase();     // use captured group
-  }
-
-  // Last resort: if job.number is non-numeric, keep it; otherwise synthesize something stable
-  if (job?.number && isNaN(Number(job.number))) return String(job.number).toUpperCase();
-  const tail = String(job?.id ?? "").slice(-4) || "0000";
-  return `F??${tail}`.toUpperCase();
-}
-
-
-// Try hard to extract a clean client/customer label from the job
-function getClientName(job) {
-  return (
-    job?.customerName ||
-    job?.customer?.name ||
-    job?.customer?.displayName ||
-    job?.client ||
-    job?.accountName ||
-    job?.customer ||
-    null
-  );
-}
-
-// "<number> <name>, <description>" with robust fallbacks
-function buildItemLabel(op) {
-  const r = op?.itemReference || {};
-  const number = r.number || r.itemNumber || r.code || r.sku || "";
-  const name   = r.name   || r.itemName   || op?.name || "";
-  const desc   = r.description || r.itemDescription || op?.description || "";
-
-  const left  = [number, name].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
-  const right = [desc].filter(Boolean).join(", ").replace(/\s+/g, " ").trim();
-
-  return right ? `${left}${left ? "" : ""}${right ? (left ? `, ${right}` : right) : ""}`.trim()
-               : (left || (op?.id ? `Item ${op.id}` : "Item"));
-}
-
-// Build a usable URL to the item.
-// Priority:
-//   - If ITEM_URL_MODE=number and we have a number: /ui/items/<number>
-//   - Else if we have an internal id:               /ui/items/<id>
-//   - Else:                                         /ui/items?query=<best label>
-// Also append a fallback search URL if mode=id fails in your tenant.
-function itemUrl(op) {
-  const r = op?.itemReference || {};
-  const number = r.number || r.itemNumber || r.code || r.sku || "";
-  const internalId = r.id || op?.itemReferenceId || op?.itemId || op?.id || "";
-
-  // Primary link by configured mode
-  if (ITEM_URL_MODE === "number" && number) return `${FULCRUM_UI_BASE}/${encodeURIComponent(number)}`;
-  if (internalId) return `${FULCRUM_UI_BASE}/${encodeURIComponent(internalId)}`;
-  if (number) return `${FULCRUM_UI_BASE}/${encodeURIComponent(number)}`;
-
-  // Last-ditch: a search URL
-  const q = buildItemLabel(op);
-  return `${FULCRUM_UI_BASE}?query=${encodeURIComponent(q)}`;
-}
-
-// One line per item inside the aggregated DESCRIPTION
-function opLine(job, op, startIso, endIso) {
-  const label = buildItemLabel(op);
-  const when = `${humanUTC(startIso)} → ${humanUTC(endIso)}`;
-  const equip = op?.scheduledEquipmentName ? ` | Equip: ${op.scheduledEquipmentName}` : "";
-  const url = itemUrl(op);
-  const linkPart = url ? ` | ${url}` : "";
-  return `- ${label} | ${when}${equip}${linkPart}`;
-}
-
-
-/* ----- whitelists (exact casing your tenant expects) ----- */
+/* ----- whitelists ----- */
 const JOB_STATUS_WHITELIST = new Set([
   "scheduled",
   "inProgress",
@@ -256,11 +155,11 @@ const OP_STATUS_WHITELIST = new Set([
   "canceled",
 ]);
 
-/* -------------------- API endpoints (declare ONCE) -------------------- */
+/* -------------------- API endpoints -------------------- */
 const JOBS_LIST = "/api/jobs/list";
 const JOB_OPS_LIST = (jobId) => `/api/jobs/${jobId}/operations/list`;
 
-/* -------------------- ops selection & mapping (job->event) -------------------- */
+/* -------------------- job -> event (legacy job-based feed) -------------------- */
 function pickPrimaryOperation(job, ops) {
   if (!Array.isArray(ops) || ops.length === 0) return null;
 
@@ -309,8 +208,7 @@ function mapJobToEvent(job, primaryOp, itemToMake) {
   const equipment = primaryOp?.scheduledEquipmentName || "";
   const opName = primaryOp?.name || "";
 
-  const itemName =
-    itemToMake?.itemReference?.name || itemToMake?.itemReference?.number || "";
+  const itemName = itemToMake?.itemReference?.name || itemToMake?.itemReference?.number || "";
   const itemDesc = itemToMake?.itemReference?.description || "";
   const qtyMake = itemToMake?.quantityToMake != null ? `Qty: ${itemToMake.quantityToMake}` : "";
 
@@ -472,65 +370,83 @@ app.get("/calendar.ics", async (req, res) => {
   }
 });
 
-/* -------------------- Change to calendar-ops.ics field mapping -------------------- */
-function mapOpToEvent(job, op) {
-  const start =
-    op?.scheduledStartUtc ||
-    op?.originalScheduledStartUtc ||
-    null;
+/* -------------------- Aggregation-specific helpers -------------------- */
 
-  let end =
-    op?.scheduledEndUtc ||
-    op?.originalScheduledEndUtc ||
-    start;
-
-  if (!start) return null;
-
-  const jobTitle = job.name || "Untitled Job";
-  const equip = op?.scheduledEquipmentName || "";
-
-  const summary = [opName, "—", jobNum ? `${jobNum}:` : "", jobTitle]
+// Extract an F-style project code like "F251289-1"
+function getProjectCode(job) {
+  const candidates = [
+    job?.projectNumber,
+    job?.jobNumber,
+    job?.numberFormatted,
+    job?.numberString,
+    job?.salesOrderId,
+    job?.orderNumber,
+    job?.number,
+    job?.customFields?.projectNumber,
+    job?.name,
+  ]
     .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ");
+    .map(String);
 
-  const fmt = (iso) => {
-    const d = new Date(iso);
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
-  };
+  const rxStrict = /^F\d{6}(?:-\d+)?$/i;      // F + 6 digits, optional -suffix
+  const rxLoose = /(F\d{6}(?:-\d+)?)/i;
 
-  const lines = [
-    `Job: ${[jobNum, jobTitle].filter(Boolean).join(" — ")}`,
-    `Operation: ${opName}`,
-    job.status ? `Status: ${job.status}` : null,
-    equip ? `Equipment: ${equip}` : null,
-    start ? `Dates: ${fmt(start)} → ${fmt(end || start)}` : null,
-    job.salesOrderId ? `Sales Order: ${job.salesOrderId}` : null,
-    `Job ID: ${job.id || "n/a"}${op?.id ? `  |  Op ID: ${op.id}` : ""}`,
-  ].filter(Boolean);
+  for (const c of candidates) {
+    const mStrict = c.match(rxStrict);
+    if (mStrict) return mStrict[0].toUpperCase();
+    const mLoose = c.match(rxLoose);
+    if (mLoose) return mLoose[1].toUpperCase();
+  }
 
-  const categories = [opName, op?.status || "", equip].filter(Boolean);
-
-  return {
-    id: job.id,
-    opId: op?.id || null,
-    start,
-    end,
-    summary,
-    location: equip || "",
-    description: lines.join("\\n"),
-    categories,
-  };
+  if (job?.number && isNaN(Number(job.number))) return String(job.number).toUpperCase();
+  const tail = String(job?.id ?? "").slice(-4) || "0000";
+  return `F??${tail}`.toUpperCase();
 }
 
-// --- helpers for aggregation ---
-function humanUTC(iso) {
+// Format: MM-DD-YYYY, HH:MM (UTC, 24h)
+function humanShortUTC(iso) {
   const d = new Date(iso);
   const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (UTC)`;
+  return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}-${d.getUTCFullYear()}, ${pad(d.getUTCHours())}:${pad(
+    d.getUTCMinutes()
+  )}`;
 }
 
+// "<number> (<name[, desc]>)" with fallbacks
+function buildItemLabelPretty(op) {
+  const r = op?.itemReference || {};
+  const number = r.number || r.itemNumber || r.code || r.sku || "";
+  const name = r.name || r.itemName || "";
+  const desc = r.description || r.itemDescription || "";
+  const paren = [name, desc].filter(Boolean).join(", ");
+  if (number && paren) return `${number} (${paren})`;
+  if (number) return number;
+  if (paren) return `(${paren})`;
+  return op?.name || op?.description || (op?.id ? `Item ${op.id}` : "Item");
+}
+
+// Try to extract a clean client/customer label
+function getClientName(job) {
+  return (
+    job?.customerName ||
+    job?.customer?.name ||
+    job?.customer?.displayName ||
+    job?.client ||
+    job?.accountName ||
+    job?.customer ||
+    null
+  );
+}
+
+// One line per item inside the aggregated DESCRIPTION (no URL for now)
+function opLine(job, op, startIso, endIso) {
+  const label = buildItemLabelPretty(op);
+  const when = `${humanShortUTC(startIso)} → ${humanShortUTC(endIso)}`;
+  const equip = op?.scheduledEquipmentName ? ` | ${op.scheduledEquipmentName}` : "";
+  return `- ${label} | ${when}${equip}`;
+}
+
+/* -------------------- OPS-DRIVEN ICS (aggregated per job × op) -------------------- */
 // /calendar-ops.ics?s=YYYY-MM-DD&u=YYYY-MM-DD&allday=1&only=Saw&statuses=ready,inProgress,paused,pending
 app.get("/calendar-ops.ics", async (req, res) => {
   try {
@@ -559,7 +475,7 @@ app.get("/calendar-ops.ics", async (req, res) => {
       ? String(req.query.statuses).split(",").map((s) => s.trim()).filter(Boolean)
       : [];
     const jobStatuses = rawStatuses.filter((s) => JOB_STATUS_WHITELIST.has(s));
-    const opStatuses  = rawStatuses.filter((s) => OP_STATUS_WHITELIST.has(s));
+    const opStatuses = rawStatuses.filter((s) => OP_STATUS_WHITELIST.has(s));
 
     const onlyOp = req.query.only ? String(req.query.only).toLowerCase() : null;
 
@@ -572,8 +488,8 @@ app.get("/calendar-ops.ics", async (req, res) => {
     const jobsResp = await postJson(JOBS_LIST, listBody);
     const jobs = unwrapItems(jobsResp);
 
-    // Fetch & filter ops per job
-    const opMap = new Map(); // jobId -> ops[]
+    // Fetch ops per job and filter
+    const opMap = new Map(); // jobId -> filtered ops[]
     for (const job of jobs) {
       try {
         const opsResp = await postJson(JOB_OPS_LIST(job.id), { limit: 500 });
@@ -581,8 +497,7 @@ app.get("/calendar-ops.ics", async (req, res) => {
         const filtered = ops.filter((o) => {
           const opStatus = String(o.status || "");
           const allowedByStatus = opStatuses.length ? opStatuses.includes(opStatus) : true;
-          const allowedByName   = onlyOp ? String(o.name || "").toLowerCase().includes(onlyOp) : true;
-          // must have sched/original start to be calendar-relevant
+          const allowedByName = onlyOp ? String(o.name || "").toLowerCase().includes(onlyOp) : true;
           const hasTime = !!(o?.scheduledStartUtc || o?.originalScheduledStartUtc);
           return allowedByStatus && allowedByName && hasTime;
         });
@@ -594,7 +509,7 @@ app.get("/calendar-ops.ics", async (req, res) => {
 
     // Aggregate: bucket by jobId + opName (case-insensitive)
     const winStart = new Date(since).getTime();
-    const winEnd   = new Date(until).getTime();
+    const winEnd = new Date(until).getTime();
     const buckets = new Map(); // key -> { job, opName, ops: [{op, startIso, endIso}] }
 
     for (const job of jobs) {
@@ -603,16 +518,16 @@ app.get("/calendar-ops.ics", async (req, res) => {
 
       for (const op of ops) {
         const startIso = op?.scheduledStartUtc || op?.originalScheduledStartUtc || null;
-        let   endIso   = op?.scheduledEndUtc   || op?.originalScheduledEndUtc   || startIso;
+        let endIso = op?.scheduledEndUtc || op?.originalScheduledEndUtc || startIso;
         if (!startIso) continue;
 
         const sMs = new Date(startIso).getTime();
         const eMs = new Date(endIso).getTime() || sMs;
         if (eMs < winStart) continue;
-        if (sMs > winEnd)   continue;
+        if (sMs > winEnd) continue;
 
         const opName = (op?.name || "Operation").trim();
-        const key2 = `${job.id}::${opName.toLowerCase()}`; // bucket key
+        const key2 = `${job.id}::${opName.toLowerCase()}`;
 
         if (!buckets.has(key2)) {
           buckets.set(key2, { job, opName, ops: [] });
@@ -627,30 +542,26 @@ app.get("/calendar-ops.ics", async (req, res) => {
       const { job, opName, ops } = bucket;
       if (!ops.length) continue;
 
-      // Earliest start, latest end across all ops in this bucket
-      const sMs = Math.min(...ops.map(x => new Date(x.startIso).getTime()));
-      const eMs = Math.max(...ops.map(x => new Date(x.endIso).getTime() || new Date(x.startIso).getTime()));
+      const sMs = Math.min(...ops.map((x) => new Date(x.startIso).getTime()));
+      const eMs = Math.max(...ops.map((x) => new Date(x.endIso).getTime() || new Date(x.startIso).getTime()));
 
       let startIso = new Date(sMs).toISOString();
-      let endIso   = new Date(eMs).toISOString();
+      let endIso = new Date(eMs).toISOString();
 
       // allday support (exclusive DTEND)
       if (wantAllDay) {
         const sDate = new Date(Date.UTC(new Date(sMs).getUTCFullYear(), new Date(sMs).getUTCMonth(), new Date(sMs).getUTCDate()));
         const eDate = new Date(Date.UTC(new Date(eMs).getUTCFullYear(), new Date(eMs).getUTCMonth(), new Date(eMs).getUTCDate() + 1));
         startIso = sDate.toISOString();
-        endIso   = eDate.toISOString();
+        endIso = eDate.toISOString();
       }
 
-      // Unique equipments across ops
-      const equipments = Array.from(new Set(ops.map(x => x.op?.scheduledEquipmentName).filter(Boolean)));
-      const location   = equipments.length === 1 ? equipments[0] : (equipments.length > 1 ? "Multiple" : "");
-
-      const jobNum   = job.number != null ? `#${job.number}` : "";
-      const jobTitle = job.name || "Untitled Job";
-      const itemCount = ops.length;
+      const equipments = Array.from(new Set(ops.map((x) => x.op?.scheduledEquipmentName).filter(Boolean)));
+      const location = equipments.length === 1 ? equipments[0] : equipments.length > 1 ? "Multiple" : "";
 
       const code = getProjectCode(job);
+      const jobNum = code;
+      const jobTitle = job.name || "Untitled Job";
       const countSuffix = ops.length > 1 ? ` (${ops.length} items)` : "";
       const summary = `${code} - ${opName}${countSuffix}`;
 
@@ -659,25 +570,25 @@ app.get("/calendar-ops.ics", async (req, res) => {
       const headerLines = [
         `Job: ${[jobNum, jobTitle].filter(Boolean).join(" — ")}`,
         `Operation: ${opName}`,
-        clientName ? `Client: ${clientName}` : null,   // <-- add/keep this
+        clientName ? `Client: ${clientName}` : null,
         job.status ? `Status: ${job.status}` : null,
         equipments.length ? `Equipment: ${equipments.join(", ")}` : null,
-        `Span: ${humanUTC(startIso)} → ${humanUTC(endIso)}`
+        `Span: ${humanShortUTC(startIso)} → ${humanShortUTC(endIso)}`
       ].filter(Boolean);
 
       const itemLines = ops
-        .sort((a,b) => new Date(a.startIso) - new Date(b.startIso))
-        .map(x => opLine(job, x.op, x.startIso, x.endIso));
+        .sort((a, b) => new Date(a.startIso) - new Date(b.startIso))
+        .map((x) => opLine(job, x.op, x.startIso, x.endIso));
 
       const description = [...headerLines, "", "Items:", ...itemLines].join("\\n");
 
       const categories = [opName, job.status || "", ...(equipments.slice(0, 3))].filter(Boolean);
 
-      // UID stable per (jobId + opName + span)
-      const uid = crypto
-        .createHash("sha1")
-        .update(`fulcrum:agg:${job.id}:${opName.toLowerCase()}:${startIso}:${endIso}`)
-        .digest("hex") + "@bettis";
+      const uid =
+        crypto
+          .createHash("sha1")
+          .update(`fulcrum:agg:${job.id}:${opName.toLowerCase()}:${startIso}:${endIso}`)
+          .digest("hex") + "@bettis";
 
       events.push({
         id: job.id,
@@ -687,7 +598,7 @@ app.get("/calendar-ops.ics", async (req, res) => {
         location,
         description,
         categories,
-        uid
+        uid,
       });
     }
 
@@ -729,7 +640,7 @@ app.get("/calendar-ops.ics", async (req, res) => {
   }
 });
 
-
+/* -------------------- Feeds discovery (cached) -------------------- */
 async function getDiscoveredOps() {
   const now = Date.now();
   if (feedsCache.payload && now - feedsCache.at < FEEDS_CACHE_TTL_SECONDS * 1000) {
@@ -779,14 +690,11 @@ async function getDiscoveredOps() {
   return feedsCache.payload;
 }
 
-/* -------------------- Pretty feeds page (SIMPLE LIST) -------------------- */
-// Requirements: list only; show name + color + hex; "Open ICS" + "Copy URL" buttons; no URL text; no tags; sorted by name.
+/* -------------------- Pretty feeds page (simple list) -------------------- */
 app.get("/feeds", async (req, res) => {
   try {
-    // use cached discovery (no duplicate scanning here)
     const { opNames: discoveredNames, debug } = await getDiscoveredOps();
 
-    // Suggested colors for known ops
     const colorMap = {
       "Laser Cut": "#f59e0b",
       "Press Brake": "#3b82f6",
@@ -825,13 +733,14 @@ app.get("/feeds", async (req, res) => {
 
     const opNames = (discoveredNames?.length ? discoveredNames : fallbackOps)
       .slice()
-      .sort((a,b) => a.localeCompare(b, undefined, { sensitivity:"base" }));
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
 
-    // Rolling window for feed URLs (past 14, next 60)
     const today = new Date();
     const isoDate = (d) => d.toISOString().slice(0, 10);
-    const start = new Date(today); start.setUTCDate(start.getUTCDate() - 14);
-    const end = new Date(today);   end.setUTCDate(end.getUTCDate() + 60);
+    const start = new Date(today);
+    start.setUTCDate(start.getUTCDate() - 14);
+    const end = new Date(today);
+    end.setUTCDate(end.getUTCDate() + 60);
     const s = isoDate(start);
     const u = isoDate(end);
     const baseUrl = `${req.protocol}://${req.get("host")}`;
@@ -845,7 +754,6 @@ app.get("/feeds", async (req, res) => {
       return { name, url, color: colorMap[name] || "#6b7280" };
     });
 
-    // Render simple list; no URL text; buttons only
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(`<!doctype html>
 <html lang="en">
@@ -904,10 +812,6 @@ app.get("/feeds", async (req, res) => {
     name.className = "name";
     name.textContent = feed.name;
 
-    const hex = document.createElement("span");
-    hex.className = "hex";
-    hex.textContent = feed.color;
-
     const openBtn = document.createElement("button");
     openBtn.className = "primary";
     openBtn.textContent = "Open ICS";
@@ -934,7 +838,6 @@ app.get("/feeds", async (req, res) => {
 
     li.appendChild(sw);
     li.appendChild(name);
-    li.appendChild(hex);
     li.appendChild(openBtn);
     li.appendChild(copyBtn);
     return li;
